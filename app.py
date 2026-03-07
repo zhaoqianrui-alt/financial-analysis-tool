@@ -39,7 +39,7 @@ def process_us_data(code):
             })
         except KeyError:
             continue
-    return df = pd.DataFrame(rows).dropna().sort_values("年份").reset_index(drop=True)
+    return pd.DataFrame(rows).dropna().sort_values("年份").reset_index(drop=True)
 
 def process_a_share_data(code):
     import akshare as ak
