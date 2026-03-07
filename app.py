@@ -39,7 +39,7 @@ def process_us_data(code):
             })
         except KeyError:
             continue
-    return pd.DataFrame(rows).sort_values("年份").reset_index(drop=True)
+    return df = pd.DataFrame(rows).dropna().sort_values("年份").reset_index(drop=True)
 
 def process_a_share_data(code):
     import akshare as ak
@@ -422,7 +422,7 @@ if st.session_state.fetched_df is not None and st.session_state.is_us_stock:
 
 预测假设：毛利率{params['gross_margin']}%，期间费用率{params['expense_ratio']}%，所得税率{params['tax_rate']}%
 
-请从以下角度给出专业点评（200字左右）：
+请从以下角度给出专业点评（500字左右）：
 1. 这个预测情景是乐观、中性还是保守？
 2. 毛利率和费用率假设是否合理？
 3. 这个盈利能力水平在同行业中处于什么位置？
