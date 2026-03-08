@@ -438,6 +438,305 @@ if st.session_state.fetched_df is not None and st.session_state.is_us_stock:
                 st.write(message.content[0].text)
 
 # ============================================================
+# 三表勾稽模块
+# 只有在预测利润表已生成后才显示
+# ============================================================
+
+if st.session_state.get("forecast_df") is not None:
+    st.divider()
+    st.header("📑 三表勾稽模型")
+    st.write("在利润表预测的基础上，补全资产负债表和现金流量表，确保三表数据互相吻合")
+
+    forecast_df = st.session_state.forecast_df
+    params = st.session_state.forecast_params
+
+    # ---- 三表假设输入 ----
+    st.subheader("补充假设")
+    st.write("以下假设用于推导资产负债表和现金流量表")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("**折旧与资本开支**")
+        # 折旧率：固定资产每年折旧的比例
+        # 背景知识：买了100亿设备，折旧率10%，每年在利润表计10亿折旧费用
+        # 折旧是"非现金支出"——钱已经花了（买设备时），但每年分摊计入费用
+        # 所以计算现金流时要把折旧加回来
+        depreciation_rate = st.number_input(
+            "折旧率%（占固定资产）",
+            value=10.0, min_value=0.0, max_value=50.0, step=0.5,
+            help="每年折旧金额 = 固定资产净值 × 折旧率"
+        )
+        # 资本开支率：每年新增资本开支占收入的比例
+        # 背景知识：公司扩张需要买设备、建厂房，这笔钱叫资本开支(Capex)
+        # 资本开支不直接进利润表，而是进资产负债表的固定资产，再通过折旧慢慢进利润表
+        capex_rate = st.number_input(
+            "资本开支率%（占收入）",
+            value=5.0, min_value=0.0, max_value=50.0, step=0.5,
+            help="每年资本开支 = 营业收入 × 资本开支率"
+        )
+    with col2:
+        st.markdown("**营运资本（周转天数）**")
+        # 背景知识：营运资本 = 应收账款 + 存货 - 应付账款
+        # 用"天数"衡量更直观：应收账款天数=30天，意思是平均30天收回货款
+        # 天数越长，占用现金越多，对公司越不利
+        ar_days = st.number_input(
+            "应收账款天数",
+            value=60, min_value=0, max_value=365, step=5,
+            help="平均多少天收回货款，天数越短越好"
+        )
+        inv_days = st.number_input(
+            "存货天数",
+            value=45, min_value=0, max_value=365, step=5,
+            help="存货平均在仓库多少天"
+        )
+        ap_days = st.number_input(
+            "应付账款天数",
+            value=45, min_value=0, max_value=365, step=5,
+            help="平均多少天付给供应商，天数越长对公司越有利"
+        )
+    with col3:
+        st.markdown("**融资与分红**")
+        # 分红率：净利润中分配给股东的比例
+        dividend_payout = st.number_input(
+            "分红率%（占净利润）",
+            value=30.0, min_value=0.0, max_value=100.0, step=5.0,
+            help="净利润中有多少比例以分红形式派发"
+        )
+        # 基准年资产负债表数据（用于推导预测期）
+        st.markdown("**基准年资产负债表**")
+        base_cash = st.number_input("基准年现金（亿美元）", value=50.0, step=1.0)
+        base_fixed_assets = st.number_input("基准年固定资产净值（亿美元）", value=100.0, step=1.0)
+        base_equity = st.number_input("基准年所有者权益（亿美元）", value=80.0, step=1.0)
+        base_debt = st.number_input("基准年有息负债（亿美元）", value=50.0, step=1.0)
+
+    if st.button("📊 生成三表模型"):
+
+        # ---- 逐年推导三张报表 ----
+        # 背景知识：三表必须"勾稽"，即互相之间数字要对得上
+        # 任何一个地方逻辑错了，整个模型就失真
+
+        income_rows = []      # 利润表汇总
+        cashflow_rows = []    # 现金流量表
+        balance_rows = []     # 资产负债表
+
+        # 上一年的资产负债表数值（第一年用基准年数据）
+        prev_cash = base_cash
+        prev_fixed_assets = base_fixed_assets
+        prev_equity = base_equity
+        prev_debt = base_debt
+
+        for _, row in forecast_df.iterrows():
+            year = row["年份"]
+            revenue = row["营业收入"]
+            net_income = row["净利润"]
+            ebit = row["营业利润(EBIT)"]
+
+            # ==============================
+            # 第一步：从利润表算出各项数值
+            # ==============================
+            capex = revenue * capex_rate / 100          # 资本开支
+            depreciation = prev_fixed_assets * depreciation_rate / 100  # 折旧（基于上期固定资产）
+            dividends = net_income * dividend_payout / 100  # 分红
+
+            # 营运资本计算
+            # 背景知识：
+            # 应收账款 = 收入 × (天数/365)  →  卖出去但还没收到钱的部分
+            # 存货 = 收入 × (天数/365)      →  还没卖出去的货
+            # 应付账款 = 收入 × (天数/365)  →  买了原料但还没付钱的部分
+            ar = revenue * ar_days / 365         # 应收账款
+            inventory = revenue * inv_days / 365  # 存货
+            ap = revenue * ap_days / 365          # 应付账款
+            net_working_capital = ar + inventory - ap  # 净营运资本
+
+            # ==============================
+            # 第二步：构建现金流量表
+            # 背景知识：现金流量表分三部分
+            # 经营活动：日常经营产生/消耗的现金
+            # 投资活动：买卖资产产生/消耗的现金（主要是资本开支）
+            # 融资活动：借钱还钱、分红产生/消耗的现金
+            # ==============================
+
+            # 经营活动现金流
+            # = 净利润（利润表底线）
+            # + 折旧（加回，因为折旧不实际花钱）
+            # - 营运资本增加（营运资本增加意味着更多现金被"锁"在应收/存货里）
+            # 简化处理：用当期营运资本直接估算，不做期初期末差
+            cfo = net_income + depreciation - (net_working_capital * 0.1)
+            # 注：0.1是简化系数，实际应用中应用期末-期初的营运资本变化
+
+            # 投资活动现金流（资本开支是现金流出，所以是负数）
+            cfi = -capex
+
+            # 融资活动现金流（分红是现金流出）
+            # 假设有息负债维持不变（不新借也不还）
+            cff = -dividends
+
+            # 自由现金流 = 经营现金流 - 资本开支
+            # 背景知识：自由现金流是公司"真正赚到手"的钱，是估值最重要的指标
+            fcf = cfo + cfi
+
+            # 现金净变化
+            net_cash_change = cfo + cfi + cff
+
+            # ==============================
+            # 第三步：构建资产负债表
+            # 背景知识：资产负债表是某一时点的"家底"快照
+            # 必须满足：总资产 = 总负债 + 所有者权益
+            # ==============================
+
+            # 资产端
+            end_cash = prev_cash + net_cash_change           # 期末现金
+            end_fixed_assets = prev_fixed_assets + capex - depreciation  # 固定资产净值
+            # 总资产 = 现金 + 固定资产 + 营运资本（应收+存货）
+            total_assets = end_cash + end_fixed_assets + ar + inventory
+
+            # 权益端
+            # 留存收益增加 = 净利润 - 分红
+            retained_earnings_increase = net_income - dividends
+            end_equity = prev_equity + retained_earnings_increase
+
+            # 负债端
+            # 应付账款（流动负债的一部分）
+            total_liabilities = ap + prev_debt  # 应付账款 + 有息负债
+
+            # ==============================
+            # 勾稽验证：总资产 = 总负债 + 所有者权益
+            # 如果不等，说明模型有逻辑错误
+            # ==============================
+            balance_check = total_assets - (total_liabilities + end_equity)
+
+            # 记录三张报表数据
+            income_rows.append({
+                "年份": year,
+                "营业收入": round(revenue, 2),
+                "折旧摊销": round(depreciation, 2),
+                "营业利润(EBIT)": round(ebit, 2),
+                "净利润": round(net_income, 2),
+                "净利率%": round(row["净利率%"], 1),
+            })
+
+            cashflow_rows.append({
+                "年份": year,
+                "经营活动现金流(CFO)": round(cfo, 2),
+                "资本开支(Capex)": round(-capex, 2),
+                "投资活动现金流(CFI)": round(cfi, 2),
+                "融资活动现金流(CFF)": round(cff, 2),
+                "自由现金流(FCF)": round(fcf, 2),
+                "现金净变化": round(net_cash_change, 2),
+            })
+
+            balance_rows.append({
+                "年份": year,
+                "现金": round(end_cash, 2),
+                "应收账款": round(ar, 2),
+                "存货": round(inventory, 2),
+                "固定资产净值": round(end_fixed_assets, 2),
+                "总资产": round(total_assets, 2),
+                "应付账款": round(ap, 2),
+                "有息负债": round(prev_debt, 2),
+                "总负债": round(total_liabilities, 2),
+                "所有者权益": round(end_equity, 2),
+                "勾稽差异": round(balance_check, 2),  # 理想情况下应接近0
+            })
+
+            # 更新"上一年"数值，用于下一年计算
+            prev_cash = end_cash
+            prev_fixed_assets = end_fixed_assets
+            prev_equity = end_equity
+
+        # ---- 展示三张报表 ----
+        income_display = pd.DataFrame(income_rows).set_index("年份")
+        cashflow_display = pd.DataFrame(cashflow_rows).set_index("年份")
+        balance_display = pd.DataFrame(balance_rows).set_index("年份")
+
+        st.subheader("📋 利润表预测（亿美元）")
+        st.dataframe(income_display)
+
+        st.subheader("📋 现金流量表预测（亿美元）")
+        st.dataframe(cashflow_display)
+
+        st.subheader("📋 资产负债表预测（亿美元）")
+        st.dataframe(balance_display)
+
+        # 勾稽验证提示
+        max_diff = balance_display["勾稽差异"].abs().max()
+        if max_diff < 1:
+            st.success(f"✅ 三表勾稽验证通过！最大差异：{round(max_diff, 3)} 亿美元（接近0，模型自洽）")
+        else:
+            st.warning(f"⚠️ 三表存在勾稽差异：{round(max_diff, 2)} 亿美元，请检查假设是否合理")
+
+        # 自由现金流图表
+        st.subheader("📈 自由现金流 vs 净利润")
+        fig_cf = go.Figure()
+        fig_cf.add_trace(go.Bar(
+            x=cashflow_display.index,
+            y=cashflow_display["自由现金流(FCF)"],
+            name="自由现金流", marker_color="#70AD47"
+        ))
+        fig_cf.add_trace(go.Scatter(
+            x=income_display.index,
+            y=income_display["净利润"],
+            name="净利润", mode="lines+markers",
+            line=dict(color="#ED7D31", width=2)
+        ))
+        fig_cf.update_layout(
+            title="自由现金流 vs 净利润对比（差距越小说明利润质量越高）",
+            plot_bgcolor="white",
+            hovermode="x unified",
+            yaxis_title="亿美元",
+            barmode="group"
+        )
+        st.plotly_chart(fig_cf, use_container_width=True)
+
+        # 存储三表数据到session_state，供后续估值模块使用
+        st.session_state.cashflow_df = pd.DataFrame(cashflow_rows)
+        st.session_state.balance_df = pd.DataFrame(balance_rows)
+        st.session_state.income_rows = income_rows
+        st.session_state.cashflow_rows = cashflow_rows
+        st.session_state.balance_rows = balance_rows
+        st.session_state.three_table_params = {
+            "depreciation_rate": depreciation_rate,
+            "capex_rate": capex_rate,
+            "ar_days": ar_days,
+            "inv_days": inv_days,
+            "ap_days": ap_days,
+            "dividend_payout": dividend_payout,
+        }
+
+    # AI解读按钮——和"生成三表模型"同级，不嵌套
+    if st.session_state.get("cashflow_rows") is not None:
+        if st.button("🤖 AI解读三表质量"):
+            income_rows = st.session_state.income_rows
+            cashflow_rows = st.session_state.cashflow_rows
+            balance_rows = st.session_state.balance_rows
+            tp = st.session_state.three_table_params
+            p = st.session_state.forecast_params
+
+            with st.spinner("AI正在分析..."):
+                prompt = f"""你是资深财务分析师。以下是{p['cname']}的预测三表关键数据：
+
+利润表净利润：{[r['净利润'] for r in income_rows]}（亿美元）
+自由现金流：{[r['自由现金流(FCF)'] for r in cashflow_rows]}（亿美元）
+资产负债率：{[round(r['总负债']/r['总资产']*100,1) for r in balance_rows]}（%）
+
+三表假设：折旧率{tp['depreciation_rate']}%，资本开支率{tp['capex_rate']}%，应收账款{tp['ar_days']}天，分红率{tp['dividend_payout']}%
+
+请从专业角度分析（300字）：
+1. 利润质量如何？自由现金流和净利润的差距说明什么？
+2. 资本开支强度是否合理？对未来增长有何影响？
+3. 营运资本假设是否符合行业惯例？
+4. 这家公司的财务健康状况如何评价？"""
+
+                client = anthropic.Anthropic(api_key=API_KEY)
+                message = client.messages.create(
+                    model="claude-opus-4-6",
+                    max_tokens=1500,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                st.subheader("🤖 AI三表质量解读")
+                st.write(message.content[0].text)
+
+# ============================================================
 # 保留原有手动上传功能
 # ============================================================
 st.divider()
