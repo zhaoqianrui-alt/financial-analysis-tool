@@ -8,6 +8,10 @@ import os
 
 load_dotenv()
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
+if not API_KEY:
+    st.error("❗ ANTHROPIC_API_KEY not found. Please add it to your .env file.")
+    st.stop()
+client = anthropic.Anthropic(api_key=API_KEY)
 
 # ============================================================
 # 数据获取函数
@@ -154,7 +158,7 @@ def build_income_statement(
 
 
 # ============================================================
-# 页面主体 - 标签页布局
+# 页面主体 - 标签页布局（每个Tab独立可用）
 # ============================================================
 
 st.title("AI Financial Analysis Tool")
@@ -174,8 +178,6 @@ for key, default in {
     "three_table_params": None,
     "dcf_result": None,
     "dcf_params": None,
-    "wacc_range": (7.0, 12.0),
-    "tg_range": (1.0, 5.0),
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -196,33 +198,26 @@ with tab1:
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        stock_code = st.text_input(
-            "Ticker Symbol",
-            placeholder="A-share: 6-digit number (e.g. 600031) · US stock: letters (e.g. AAPL)"
-        )
+        stock_code = st.text_input("Ticker Symbol",
+            placeholder="A-share: 6-digit number (e.g. 600031) · US stock: letters (e.g. AAPL)")
     with col2:
         company_name = st.text_input("Company Name", placeholder="e.g. Apple")
 
     if stock_code and company_name:
-        if st.button("🔍 Fetch Data", key="fetch_btn"):
+        if st.button("🔍 Fetch Data"):
             with st.spinner("Fetching financial data..."):
                 try:
                     if is_a_share(stock_code):
-                        st.info(f"✅ A-share detected. Fetching {company_name}...")
                         df = process_a_share_data(stock_code)
                         st.session_state.fetched_df = df
                         st.session_state.fetched_company = company_name
                         st.session_state.is_us_stock = False
-                        st.subheader("Financial Indicators (Annual)")
-                        st.dataframe(df)
                         st.success("Data fetched successfully!")
                     else:
-                        st.info(f"✅ US stock detected. Fetching {company_name} from Yahoo Finance...")
                         df = process_us_data(stock_code)
                         st.session_state.fetched_df = df
                         st.session_state.fetched_company = company_name
                         st.session_state.is_us_stock = True
-
                         if df.empty:
                             st.warning("No data found. Please check the ticker symbol.")
                         else:
@@ -230,43 +225,30 @@ with tab1:
                             net_col = "净利润(亿美元)"
                             liab_col = "总负债(亿美元)"
                             asset_col = "总资产(亿美元)"
-
                             df["净利率%"] = round(df[net_col] / df[rev_col] * 100, 2)
                             df["资产负债率%"] = round(df[liab_col] / df[asset_col] * 100, 2)
                             df["收入增速%"] = round(df[rev_col].pct_change() * 100, 2)
                             st.session_state.fetched_df = df
-
+                            st.success("Data fetched successfully!")
                 except Exception as e:
-                    st.error(f"Error fetching data: {e}")
-                    st.write("💡 Check: 1) Ticker symbol correct  2) Network connection")
+                    st.error(f"Error: {e}")
 
-    # 展示已获取的数据（每次进tab都显示）
     if st.session_state.fetched_df is not None and st.session_state.is_us_stock:
         df = st.session_state.fetched_df
         cname = st.session_state.fetched_company
-        rev_col = "营业收入(亿美元)"
-        net_col = "净利润(亿美元)"
-        liab_col = "总负债(亿美元)"
-        asset_col = "总资产(亿美元)"
-
         st.subheader(f"{cname} — Historical Financials (USD bn)")
         st.dataframe(df)
-
-        st.subheader("Key Ratios Trend")
         chart_df = df[["年份", "净利率%", "资产负债率%"]].copy()
         chart_df["年份"] = chart_df["年份"].astype(str)
-        fig = px.line(
-            chart_df.melt(id_vars="年份", var_name="Metric", value_name="Value"),
-            x="年份", y="Value", color="Metric",
-            markers=True, title=f"{cname} — Net Margin % & Debt Ratio %"
-        )
+        fig = px.line(chart_df.melt(id_vars="年份", var_name="Metric", value_name="Value"),
+            x="年份", y="Value", color="Metric", markers=True,
+            title=f"{cname} — Net Margin % & Debt Ratio %")
         fig.update_layout(hovermode="x unified", plot_bgcolor="white")
         st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Risk Flags")
         latest = df.iloc[-1]
+        st.subheader("Risk Flags")
         if latest["资产负债率%"] > 70:
-            st.error(f"⚠️ High leverage: {latest['资产负债率%']}% (threshold: 70%)")
+            st.error(f"⚠️ High leverage: {latest['资产负债率%']}%")
         else:
             st.success(f"✅ Leverage normal: {latest['资产负债率%']}%")
         if latest["净利率%"] < 0:
@@ -285,410 +267,426 @@ with tab1:
             st.dataframe(df_m[["年份", "净利率%", "资产负债率%", "收入增速%"]])
             if st.button("Generate AI Report", key="manual_ai"):
                 with st.spinner("Analyzing..."):
-                    data_text = ""
-                    for _, row in df_m.iterrows():
-                        data_text += f"{int(row['年份'])}: Net margin {row['净利率%']}%, Debt ratio {row['资产负债率%']}%, Revenue growth {row['收入增速%']}%\n"
-                    prompt = f"As a securities analyst, analyze {manual_company} in 200 words:\n{data_text}\nCover profitability, financial risk, and investment value."
-                    client = anthropic.Anthropic(api_key=API_KEY)
-                    message = client.messages.create(
-                        model="claude-opus-4-6", max_tokens=1024,
-                        messages=[{"role": "user", "content": prompt}]
-                    )
-                    st.subheader("AI Analysis Report")
-                    st.write(message.content[0].text)
+                    data_text = "".join(f"{int(r['年份'])}: Net margin {r['净利率%']}%, Debt ratio {r['资产负债率%']}%\n" for _, r in df_m.iterrows())
+                    prompt = f"As a securities analyst, analyze {manual_company} in 200 words:\n{data_text}"
+                    msg = client.messages.create(model="claude-opus-4-6", max_tokens=1024,
+                        messages=[{"role": "user", "content": prompt}])
+                    st.write(msg.content[0].text)
 
 # ============================================================
 # TAB 2: FORECAST
 # ============================================================
 with tab2:
     st.header("Income Statement Forecast")
-    st.write("Define revenue drivers and build a 3-year income statement projection.")
 
-    if st.session_state.fetched_df is None or not st.session_state.is_us_stock:
-        st.info("👈 Please fetch US stock data in the **Data** tab first.")
-    else:
+    # ---- 数据来源：自动填入 or 手动输入 ----
+    # 背景知识：如果 Data tab 已经获取了数据，就自动读取基准年数据
+    # 如果没有，用户可以在下面的手动输入框直接填数字，一样能跑
+
+    if st.session_state.fetched_df is not None and st.session_state.is_us_stock:
         df = st.session_state.fetched_df
-        cname = st.session_state.fetched_company
-        rev_col = "营业收入(亿美元)"
-        net_col = "净利润(亿美元)"
+        cname_f = st.session_state.fetched_company
+        latest_row = df.dropna(subset=["营业收入(亿美元)"]).iloc[-1]
+        auto_base_year = int(latest_row["年份"])
+        auto_base_rev = float(latest_row["营业收入(亿美元)"])
+        st.success(f"✅ Using data from Data tab: **{cname_f}**, base year **{auto_base_year}**, revenue **{auto_base_rev} bn**")
+        use_auto = True
+    else:
+        use_auto = False
 
-        latest_row = df.dropna(subset=[rev_col]).iloc[-1]
-        base_year = int(latest_row["年份"])
-        base_revenue = latest_row[rev_col]
+    with st.expander("📥 Manual Input — enter base year data directly", expanded=not use_auto):
+        m_cname = st.text_input("Company name", value="My Company", key="f_cname")
+        m_base_year = st.number_input("Base year", value=2024, min_value=2000, max_value=2030, step=1, key="f_year")
+        m_base_rev = st.number_input("Base year revenue (USD bn)", value=100.0, min_value=0.1, step=1.0, key="f_rev")
 
-        st.info(f"Base year: **{base_year}** · Revenue: **{base_revenue} bn USD**")
+    # 决定用哪个数据源
+    if use_auto:
+        f_cname = cname_f
+        f_base_year = auto_base_year
+        f_base_rev = auto_base_rev
+        f_hist_df = df
+    else:
+        f_cname = m_cname
+        f_base_year = int(m_base_year)
+        f_base_rev = m_base_rev
+        f_hist_df = None
 
-        st.subheader("Step 1 — Revenue Drivers")
-        st.write("Revenue = Driver 1 × Driver 2 (× Driver 3), e.g. Units Sold × ASP")
-        num_drivers = st.radio("Number of drivers", [1, 2, 3], index=1, horizontal=True)
+    st.info(f"Base year: **{f_base_year}** · Revenue: **{f_base_rev} bn USD**")
 
-        driver_names, driver_bases = [], []
-        for i in range(num_drivers):
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                name = st.text_input(f"Driver {i+1} name",
-                    value=["Units Sold (mn)", "ASP (USD)", "Market Share%"][i],
-                    key=f"driver_name_{i}")
-            with c2:
-                base_val = st.number_input(f"Driver {i+1} base ({base_year})",
-                    value=100.0, key=f"driver_base_{i}")
-            driver_names.append(name)
-            driver_bases.append(base_val)
+    st.subheader("Step 1 — Revenue Drivers")
+    num_drivers = st.radio("Number of drivers", [1, 2, 3], index=1, horizontal=True)
+    driver_names, driver_bases = [], []
+    for i in range(num_drivers):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            name = st.text_input(f"Driver {i+1} name",
+                value=["Units Sold (mn)", "ASP (USD)", "Market Share%"][i], key=f"driver_name_{i}")
+        with c2:
+            base_val = st.number_input(f"Base value ({f_base_year})", value=100.0, key=f"driver_base_{i}")
+        driver_names.append(name)
+        driver_bases.append(base_val)
 
-        st.subheader("Step 2 — 3-Year Projections")
-        st.write("**Revenue driver forecasts**")
-        forecast_years = [base_year + 1, base_year + 2, base_year + 3]
-        year_cols = st.columns(3)
-        year_driver_values = []
-        for yi, year in enumerate(forecast_years):
-            with year_cols[yi]:
-                st.markdown(f"**{year}**")
-                year_vals = []
-                for di in range(num_drivers):
-                    val = st.number_input(driver_names[di],
-                        value=float(driver_bases[di]), key=f"forecast_{yi}_{di}")
-                    year_vals.append(val)
-                year_driver_values.append(year_vals)
+    st.subheader("Step 2 — 3-Year Projections")
+    forecast_years = [f_base_year + 1, f_base_year + 2, f_base_year + 3]
+    year_cols = st.columns(3)
+    year_driver_values = []
+    for yi, year in enumerate(forecast_years):
+        with year_cols[yi]:
+            st.markdown(f"**{year}**")
+            year_vals = []
+            for di in range(num_drivers):
+                val = st.number_input(driver_names[di], value=float(driver_bases[di]), key=f"forecast_{yi}_{di}")
+                year_vals.append(val)
+            year_driver_values.append(year_vals)
 
-        st.write("**P&L assumptions**")
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            gross_margin = st.number_input("Gross margin %", value=40.0, min_value=0.0, max_value=100.0, step=0.5)
-        with col_b:
-            expense_ratio = st.number_input("Opex ratio %", value=20.0, min_value=0.0, max_value=100.0, step=0.5,
-                help="SG&A + R&D as % of revenue")
-        with col_c:
-            tax_rate = st.number_input("Tax rate %", value=25.0, min_value=0.0, max_value=50.0, step=0.5)
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        gross_margin = st.number_input("Gross margin %", value=40.0, min_value=0.0, max_value=100.0, step=0.5)
+    with col_b:
+        expense_ratio = st.number_input("Opex ratio %", value=20.0, min_value=0.0, max_value=100.0, step=0.5)
+    with col_c:
+        tax_rate = st.number_input("Tax rate %", value=25.0, min_value=0.0, max_value=50.0, step=0.5)
 
-        if st.button("📈 Generate Income Statement Forecast"):
-            forecast_df, combined_df = build_income_statement(
-                base_revenue=base_revenue, driver_names=driver_names,
-                driver_base=driver_bases, driver_forecasts=year_driver_values,
-                gross_margin=gross_margin, expense_ratio=expense_ratio,
-                tax_rate=tax_rate, base_year=base_year,
-                hist_df=df, rev_col=rev_col, net_col=net_col,
-            )
-            st.session_state.forecast_df = forecast_df
-            st.session_state.combined_df = combined_df
-            st.session_state.forecast_params = {
-                "gross_margin": gross_margin, "expense_ratio": expense_ratio,
-                "tax_rate": tax_rate, "cname": cname,
-            }
+    if st.button("📈 Generate Forecast"):
+        forecast_df, combined_df = build_income_statement(
+            base_revenue=f_base_rev, driver_names=driver_names,
+            driver_base=driver_bases, driver_forecasts=year_driver_values,
+            gross_margin=gross_margin, expense_ratio=expense_ratio,
+            tax_rate=tax_rate, base_year=f_base_year,
+            hist_df=f_hist_df,
+            rev_col="营业收入(亿美元)" if f_hist_df is not None else None,
+            net_col="净利润(亿美元)" if f_hist_df is not None else None,
+        )
+        st.session_state.forecast_df = forecast_df
+        st.session_state.combined_df = combined_df
+        st.session_state.forecast_params = {
+            "gross_margin": gross_margin, "expense_ratio": expense_ratio,
+            "tax_rate": tax_rate, "cname": f_cname,
+        }
 
-        if st.session_state.forecast_df is not None:
-            forecast_df = st.session_state.forecast_df
-            combined_df = st.session_state.combined_df
-            params = st.session_state.forecast_params
+    if st.session_state.forecast_df is not None:
+        forecast_df = st.session_state.forecast_df
+        combined_df = st.session_state.combined_df
+        params = st.session_state.forecast_params
 
-            st.subheader("Projected Income Statement (USD bn)")
-            display_cols = ["年份", "营业收入", "毛利润", "营业利润(EBIT)", "净利润", "毛利率%", "净利率%"]
-            st.dataframe(forecast_df[display_cols].set_index("年份"))
+        st.subheader("Projected Income Statement (USD bn)")
+        st.dataframe(forecast_df[["年份","营业收入","毛利润","营业利润(EBIT)","净利润","毛利率%","净利率%"]].set_index("年份"))
 
-            st.subheader("Historical vs Forecast")
-            hist_data = combined_df[combined_df["类型"] == "历史"]
-            forecast_data = combined_df[combined_df["类型"] == "预测"]
+        hist_data = combined_df[combined_df["类型"] == "历史"]
+        forecast_data = combined_df[combined_df["类型"] == "预测"]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=hist_data["年份"], y=hist_data["营业收入"], name="Historical Revenue", marker_color="#4472C4", opacity=0.8))
+        fig.add_trace(go.Bar(x=forecast_data["年份"], y=forecast_data["营业收入"], name="Forecast Revenue", marker_color="#4472C4", opacity=0.4, marker_pattern_shape="/"))
+        fig.add_trace(go.Scatter(x=hist_data["年份"], y=hist_data["净利润"], name="Historical Net Income", mode="lines+markers", line=dict(color="#ED7D31", width=2)))
+        fig.add_trace(go.Scatter(x=forecast_data["年份"], y=forecast_data["净利润"], name="Forecast Net Income", mode="lines+markers", line=dict(color="#ED7D31", width=2, dash="dash")))
+        fig.update_layout(title=f"{params['cname']} — Revenue & Net Income",
+            barmode="group", hovermode="x unified", plot_bgcolor="white", yaxis_title="USD bn",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        st.plotly_chart(fig, use_container_width=True)
 
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=hist_data["年份"], y=hist_data["营业收入"], name="Historical Revenue", marker_color="#4472C4", opacity=0.8))
-            fig.add_trace(go.Bar(x=forecast_data["年份"], y=forecast_data["营业收入"], name="Forecast Revenue", marker_color="#4472C4", opacity=0.4, marker_pattern_shape="/"))
-            fig.add_trace(go.Scatter(x=hist_data["年份"], y=hist_data["净利润"], name="Historical Net Income", mode="lines+markers", line=dict(color="#ED7D31", width=2)))
-            fig.add_trace(go.Scatter(x=forecast_data["年份"], y=forecast_data["净利润"], name="Forecast Net Income", mode="lines+markers", line=dict(color="#ED7D31", width=2, dash="dash")))
-            fig.update_layout(title=f"{params['cname']} — Revenue & Net Income", barmode="group",
-                hovermode="x unified", plot_bgcolor="white", yaxis_title="USD bn",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02))
-            st.plotly_chart(fig, use_container_width=True)
-
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=hist_data["年份"], y=hist_data["净利率%"], name="Historical", mode="lines+markers", line=dict(color="#70AD47", width=2)))
-            fig2.add_trace(go.Scatter(x=forecast_data["年份"], y=forecast_data["净利率%"], name="Forecast", mode="lines+markers", line=dict(color="#70AD47", width=2, dash="dash")))
-            fig2.update_layout(title="Net Margin % — Historical vs Forecast", plot_bgcolor="white", yaxis_title="%", hovermode="x unified")
-            st.plotly_chart(fig2, use_container_width=True)
-
-            if st.button("🤖 AI Commentary on Forecast"):
-                with st.spinner("Analyzing..."):
-                    forecast_text = "".join(f"{row['年份']}: Revenue {row['营业收入']} bn, Net Income {row['净利润']} bn, Net margin {row['净利率%']}%\n" for _, row in forecast_df.iterrows())
-                    prompt = f"""You are a senior equity research analyst. Here is the financial forecast for {params['cname']}:
-
-{forecast_text}
-
-Assumptions: Gross margin {params['gross_margin']}%, Opex ratio {params['expense_ratio']}%, Tax rate {params['tax_rate']}%
-
-Provide a professional commentary (~300 words):
-1. Is this scenario bullish, base, or bearish?
-2. Are the margin assumptions reasonable?
-3. How does this profitability compare to industry peers?
-4. What are the key forecast risks?"""
-                    client = anthropic.Anthropic(api_key=API_KEY)
-                    message = client.messages.create(model="claude-opus-4-6", max_tokens=1024,
-                        messages=[{"role": "user", "content": prompt}])
-                    st.subheader("🤖 AI Forecast Commentary")
-                    st.write(message.content[0].text)
+        if st.button("🤖 AI Commentary"):
+            with st.spinner("Analyzing..."):
+                ft = "".join(f"{r['年份']}: Rev {r['营业收入']} bn, NI {r['净利润']} bn, Margin {r['净利率%']}%\n" for _, r in forecast_df.iterrows())
+                prompt = f"""Senior equity analyst. Forecast for {params['cname']}:
+{ft}
+Assumptions: GM {params['gross_margin']}%, Opex {params['expense_ratio']}%, Tax {params['tax_rate']}%
+Commentary (~300 words): 1) Bull/base/bear? 2) Margin assumptions reasonable? 3) Key risks?"""
+                msg = client.messages.create(model="claude-opus-4-6", max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}])
+                st.subheader("🤖 AI Commentary")
+                st.write(msg.content[0].text)
 
 # ============================================================
 # TAB 3: 3-STATEMENT
 # ============================================================
 with tab3:
     st.header("3-Statement Model")
-    st.write("Extend the income statement forecast to a full balance sheet and cash flow statement.")
 
-    if st.session_state.forecast_df is None:
-        st.info("👈 Please complete the income statement forecast in the **Forecast** tab first.")
+    # ---- 数据来源：自动填入 or 手动输入 ----
+    if st.session_state.forecast_df is not None:
+        auto_forecast = st.session_state.forecast_df
+        auto_params = st.session_state.forecast_params
+        st.success(f"✅ Using forecast from Forecast tab: **{auto_params['cname']}**")
+        use_auto_3s = True
     else:
-        forecast_df = st.session_state.forecast_df
-        params = st.session_state.forecast_params
+        use_auto_3s = False
 
-        st.subheader("Additional Assumptions")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**Depreciation & Capex**")
-            depreciation_rate = st.number_input("Depreciation rate % (of PP&E)", value=10.0, min_value=0.0, max_value=50.0, step=0.5, help="Annual depreciation = PP&E × rate")
-            capex_rate = st.number_input("Capex rate % (of revenue)", value=5.0, min_value=0.0, max_value=50.0, step=0.5)
-        with col2:
-            st.markdown("**Working Capital (Days)**")
-            ar_days = st.number_input("Receivables days (DSO)", value=60, min_value=0, max_value=365, step=5)
-            inv_days = st.number_input("Inventory days (DIO)", value=45, min_value=0, max_value=365, step=5)
-            ap_days = st.number_input("Payables days (DPO)", value=45, min_value=0, max_value=365, step=5)
-        with col3:
-            st.markdown("**Financing & Dividends**")
-            dividend_payout = st.number_input("Dividend payout % (of net income)", value=30.0, min_value=0.0, max_value=100.0, step=5.0)
-            st.markdown("**Base Year Balance Sheet**")
-            base_cash = st.number_input("Cash (USD bn)", value=50.0, step=1.0)
-            base_fixed_assets = st.number_input("PP&E net (USD bn)", value=100.0, step=1.0)
-            base_equity = st.number_input("Shareholders' equity (USD bn)", value=80.0, step=1.0)
-            base_debt = st.number_input("Interest-bearing debt (USD bn)", value=50.0, step=1.0)
+    with st.expander("📥 Manual Input — enter projected P&L directly", expanded=not use_auto_3s):
+        st.write("Enter your 3-year net income and revenue forecasts:")
+        m3_cname = st.text_input("Company name", value="My Company", key="3s_cname")
+        cols_y = st.columns(3)
+        manual_years = []
+        manual_revenues = []
+        manual_net_incomes = []
+        manual_ebits = []
+        manual_margins = []
+        for i, col in enumerate(cols_y):
+            with col:
+                yr = st.number_input(f"Year {i+1}", value=2025+i, min_value=2020, max_value=2035, step=1, key=f"3s_year_{i}")
+                rev = st.number_input("Revenue (bn)", value=100.0*(1+0.05*i), step=1.0, key=f"3s_rev_{i}")
+                ni = st.number_input("Net Income (bn)", value=15.0*(1+0.05*i), step=0.5, key=f"3s_ni_{i}")
+                manual_years.append(str(int(yr)))
+                manual_revenues.append(rev)
+                manual_net_incomes.append(ni)
+                ebit = ni / 0.75  # 反推EBIT（假设税率25%）
+                manual_ebits.append(round(ebit, 2))
+                manual_margins.append(round(ni/rev*100, 1) if rev > 0 else 0)
 
-        if st.button("📑 Build 3-Statement Model"):
-            income_rows, cashflow_rows, balance_rows = [], [], []
-            prev_cash, prev_fixed_assets_val, prev_equity, prev_debt = base_cash, base_fixed_assets, base_equity, base_debt
+    # 构建 forecast_df 供三表使用
+    if use_auto_3s:
+        s3_forecast_df = auto_forecast
+        s3_cname = auto_params["cname"]
+    else:
+        s3_forecast_df = pd.DataFrame({
+            "年份": manual_years,
+            "营业收入": manual_revenues,
+            "净利润": manual_net_incomes,
+            "营业利润(EBIT)": manual_ebits,
+            "净利率%": manual_margins,
+            "毛利率%": [40.0]*3,
+            "毛利润": [r*0.4 for r in manual_revenues],
+            "类型": ["预测"]*3,
+        })
+        s3_cname = m3_cname
 
-            for _, row in forecast_df.iterrows():
-                year = row["年份"]
-                revenue = row["营业收入"]
-                net_income = row["净利润"]
-                ebit = row["营业利润(EBIT)"]
+    st.subheader("Balance Sheet & Cash Flow Assumptions")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("**Depreciation & Capex**")
+        depreciation_rate = st.number_input("D&A rate % (of PP&E)", value=10.0, min_value=0.0, max_value=50.0, step=0.5)
+        capex_rate = st.number_input("Capex % (of revenue)", value=5.0, min_value=0.0, max_value=50.0, step=0.5)
+    with col2:
+        st.markdown("**Working Capital (Days)**")
+        ar_days = st.number_input("DSO — Receivables days", value=60, min_value=0, max_value=365, step=5)
+        inv_days = st.number_input("DIO — Inventory days", value=45, min_value=0, max_value=365, step=5)
+        ap_days = st.number_input("DPO — Payables days", value=45, min_value=0, max_value=365, step=5)
+    with col3:
+        st.markdown("**Base Year Balance Sheet**")
+        dividend_payout = st.number_input("Dividend payout %", value=30.0, min_value=0.0, max_value=100.0, step=5.0)
+        base_cash = st.number_input("Cash (bn)", value=50.0, step=1.0)
+        base_fixed_assets = st.number_input("PP&E net (bn)", value=100.0, step=1.0)
+        base_equity = st.number_input("Equity (bn)", value=80.0, step=1.0)
+        base_debt = st.number_input("Debt (bn)", value=50.0, step=1.0)
 
-                capex = revenue * capex_rate / 100
-                depreciation = prev_fixed_assets_val * depreciation_rate / 100
-                dividends = net_income * dividend_payout / 100
-                ar = revenue * ar_days / 365
-                inventory = revenue * inv_days / 365
-                ap = revenue * ap_days / 365
-                net_working_capital = ar + inventory - ap
-                cfo = net_income + depreciation - (net_working_capital * 0.1)
-                cfi = -capex
-                cff = -dividends
-                fcf = cfo + cfi
-                net_cash_change = cfo + cfi + cff
+    if st.button("📑 Build 3-Statement Model"):
+        income_rows, cashflow_rows, balance_rows = [], [], []
+        prev_cash, prev_fa, prev_eq, prev_debt = base_cash, base_fixed_assets, base_equity, base_debt
 
-                end_cash = prev_cash + net_cash_change
-                end_fixed_assets = prev_fixed_assets_val + capex - depreciation
-                total_assets = end_cash + end_fixed_assets + ar + inventory
-                end_equity = prev_equity + (net_income - dividends)
-                total_liabilities = ap + prev_debt
-                balance_check = total_assets - (total_liabilities + end_equity)
+        for _, row in s3_forecast_df.iterrows():
+            year = row["年份"]
+            revenue = row["营业收入"]
+            net_income = row["净利润"]
+            ebit = row["营业利润(EBIT)"]
 
-                income_rows.append({"Year": year, "Revenue": round(revenue, 2), "D&A": round(depreciation, 2), "EBIT": round(ebit, 2), "Net Income": round(net_income, 2), "Net Margin%": round(row["净利率%"], 1)})
-                cashflow_rows.append({"Year": year, "CFO": round(cfo, 2), "Capex": round(-capex, 2), "CFI": round(cfi, 2), "CFF": round(cff, 2), "FCF": round(fcf, 2), "Net Change": round(net_cash_change, 2)})
-                balance_rows.append({"Year": year, "Cash": round(end_cash, 2), "Receivables": round(ar, 2), "Inventory": round(inventory, 2), "PP&E net": round(end_fixed_assets, 2), "Total Assets": round(total_assets, 2), "Payables": round(ap, 2), "Debt": round(prev_debt, 2), "Total Liabilities": round(total_liabilities, 2), "Equity": round(end_equity, 2), "Check": round(balance_check, 2)})
+            capex = revenue * capex_rate / 100
+            depreciation = prev_fa * depreciation_rate / 100
+            dividends = net_income * dividend_payout / 100
+            ar = revenue * ar_days / 365
+            inventory = revenue * inv_days / 365
+            ap = revenue * ap_days / 365
+            nwc = ar + inventory - ap
+            cfo = net_income + depreciation - (nwc * 0.1)
+            cfi = -capex
+            cff = -dividends
+            fcf = cfo + cfi
+            net_cash_change = cfo + cfi + cff
 
-                prev_cash = end_cash
-                prev_fixed_assets_val = end_fixed_assets
-                prev_equity = end_equity
+            end_cash = prev_cash + net_cash_change
+            end_fa = prev_fa + capex - depreciation
+            total_assets = end_cash + end_fa + ar + inventory
+            end_equity = prev_eq + (net_income - dividends)
+            total_liabilities = ap + prev_debt
+            check = total_assets - (total_liabilities + end_equity)
 
-            st.session_state.income_rows = income_rows
-            st.session_state.cashflow_rows = cashflow_rows
-            st.session_state.balance_rows = balance_rows
-            st.session_state.three_table_params = {"depreciation_rate": depreciation_rate, "capex_rate": capex_rate, "ar_days": ar_days, "inv_days": inv_days, "ap_days": ap_days, "dividend_payout": dividend_payout}
+            income_rows.append({"Year": year, "Revenue": round(revenue,2), "D&A": round(depreciation,2), "EBIT": round(ebit,2), "Net Income": round(net_income,2), "Net Margin%": round(row["净利率%"],1)})
+            cashflow_rows.append({"Year": year, "CFO": round(cfo,2), "Capex": round(-capex,2), "CFI": round(cfi,2), "CFF": round(cff,2), "FCF": round(fcf,2), "Net Change": round(net_cash_change,2)})
+            balance_rows.append({"Year": year, "Cash": round(end_cash,2), "Receivables": round(ar,2), "Inventory": round(inventory,2), "PP&E": round(end_fa,2), "Total Assets": round(total_assets,2), "Payables": round(ap,2), "Debt": round(prev_debt,2), "Total Liabilities": round(total_liabilities,2), "Equity": round(end_equity,2), "Check": round(check,2)})
 
-        if st.session_state.cashflow_rows is not None:
-            income_rows = st.session_state.income_rows
-            cashflow_rows = st.session_state.cashflow_rows
-            balance_rows = st.session_state.balance_rows
+            prev_cash, prev_fa, prev_eq = end_cash, end_fa, end_equity
 
-            st.subheader("Income Statement (USD bn)")
-            st.dataframe(pd.DataFrame(income_rows).set_index("Year"))
-            st.subheader("Cash Flow Statement (USD bn)")
-            st.dataframe(pd.DataFrame(cashflow_rows).set_index("Year"))
-            st.subheader("Balance Sheet (USD bn)")
-            balance_display = pd.DataFrame(balance_rows).set_index("Year")
-            st.dataframe(balance_display)
+        st.session_state.income_rows = income_rows
+        st.session_state.cashflow_rows = cashflow_rows
+        st.session_state.balance_rows = balance_rows
+        st.session_state.three_table_params = {"depreciation_rate": depreciation_rate, "capex_rate": capex_rate, "ar_days": ar_days, "inv_days": inv_days, "ap_days": ap_days, "dividend_payout": dividend_payout, "cname": s3_cname}
 
-            max_diff = balance_display["Check"].abs().max()
-            if max_diff < 1:
-                st.success(f"✅ Balance sheet checks out. Max discrepancy: {round(max_diff, 3)} bn")
-            else:
-                st.warning(f"⚠️ Balance sheet discrepancy: {round(max_diff, 2)} bn — review assumptions")
+    if st.session_state.cashflow_rows is not None:
+        income_rows = st.session_state.income_rows
+        cashflow_rows = st.session_state.cashflow_rows
+        balance_rows = st.session_state.balance_rows
 
-            fig_cf = go.Figure()
-            fig_cf.add_trace(go.Bar(x=[r["Year"] for r in cashflow_rows], y=[r["FCF"] for r in cashflow_rows], name="Free Cash Flow", marker_color="#70AD47"))
-            fig_cf.add_trace(go.Scatter(x=[r["Year"] for r in income_rows], y=[r["Net Income"] for r in income_rows], name="Net Income", mode="lines+markers", line=dict(color="#ED7D31", width=2)))
-            fig_cf.update_layout(title="FCF vs Net Income (smaller gap = higher earnings quality)", plot_bgcolor="white", hovermode="x unified", yaxis_title="USD bn")
-            st.plotly_chart(fig_cf, use_container_width=True)
+        st.subheader("Income Statement")
+        st.dataframe(pd.DataFrame(income_rows).set_index("Year"))
+        st.subheader("Cash Flow Statement")
+        st.dataframe(pd.DataFrame(cashflow_rows).set_index("Year"))
+        st.subheader("Balance Sheet")
+        bd = pd.DataFrame(balance_rows).set_index("Year")
+        st.dataframe(bd)
 
-            if st.button("🤖 AI Commentary on 3-Statement Quality"):
-                with st.spinner("Analyzing..."):
-                    tp = st.session_state.three_table_params
-                    p = st.session_state.forecast_params
-                    prompt = f"""You are a senior financial analyst. Here is the 3-statement model for {p['cname']}:
+        max_diff = bd["Check"].abs().max()
+        if max_diff < 1:
+            st.success(f"✅ Balance sheet checks out. Max discrepancy: {round(max_diff,3)} bn")
+        else:
+            st.warning(f"⚠️ Discrepancy: {round(max_diff,2)} bn")
 
-Net Income: {[r['Net Income'] for r in income_rows]} (USD bn)
-Free Cash Flow: {[r['FCF'] for r in cashflow_rows]} (USD bn)
-Debt ratio: {[round(r['Total Liabilities']/r['Total Assets']*100,1) for r in balance_rows]} (%)
+        fig_cf = go.Figure()
+        fig_cf.add_trace(go.Bar(x=[r["Year"] for r in cashflow_rows], y=[r["FCF"] for r in cashflow_rows], name="FCF", marker_color="#70AD47"))
+        fig_cf.add_trace(go.Scatter(x=[r["Year"] for r in income_rows], y=[r["Net Income"] for r in income_rows], name="Net Income", mode="lines+markers", line=dict(color="#ED7D31", width=2)))
+        fig_cf.update_layout(title="FCF vs Net Income", plot_bgcolor="white", hovermode="x unified", yaxis_title="bn")
+        st.plotly_chart(fig_cf, use_container_width=True)
 
-Assumptions: D&A rate {tp['depreciation_rate']}%, Capex rate {tp['capex_rate']}%, DSO {tp['ar_days']} days, Dividend payout {tp['dividend_payout']}%
-
-Provide a professional analysis (~300 words):
-1. Earnings quality: what does the FCF vs Net Income gap indicate?
-2. Is the capex intensity reasonable? What does it imply for growth?
-3. Are the working capital assumptions in line with industry norms?
-4. Overall financial health assessment."""
-                    client = anthropic.Anthropic(api_key=API_KEY)
-                    message = client.messages.create(model="claude-opus-4-6", max_tokens=1500,
-                        messages=[{"role": "user", "content": prompt}])
-                    st.subheader("🤖 AI 3-Statement Commentary")
-                    st.write(message.content[0].text)
+        if st.button("🤖 AI 3-Statement Commentary"):
+            with st.spinner("Analyzing..."):
+                tp = st.session_state.three_table_params
+                prompt = f"""Senior financial analyst. 3-statement model for {tp['cname']}:
+Net Income: {[r['Net Income'] for r in income_rows]} bn
+FCF: {[r['FCF'] for r in cashflow_rows]} bn
+Debt ratio: {[round(r['Total Liabilities']/r['Total Assets']*100,1) for r in balance_rows]}%
+Assumptions: D&A {tp['depreciation_rate']}%, Capex {tp['capex_rate']}%, DSO {tp['ar_days']}d, DPO {tp['ap_days']}d
+Analysis (~300 words): 1) Earnings quality? 2) Capex intensity? 3) Working capital norms? 4) Financial health?"""
+                msg = client.messages.create(model="claude-opus-4-6", max_tokens=1500,
+                    messages=[{"role": "user", "content": prompt}])
+                st.subheader("🤖 AI Commentary")
+                st.write(msg.content[0].text)
 
 # ============================================================
 # TAB 4: VALUATION
 # ============================================================
 with tab4:
     st.header("DCF Valuation")
-    st.write("Discount projected free cash flows to estimate intrinsic value per share.")
 
-    if st.session_state.cashflow_rows is None:
-        st.info("👈 Please complete the 3-Statement model in the **3-Statement** tab first.")
+    # ---- 数据来源：自动填入 or 手动输入 ----
+    if st.session_state.cashflow_rows is not None:
+        auto_fcf = [r["FCF"] for r in st.session_state.cashflow_rows]
+        auto_years = [r["Year"] for r in st.session_state.cashflow_rows]
+        auto_vcname = st.session_state.three_table_params.get("cname", "Company")
+        st.success(f"✅ Using FCF from 3-Statement tab: **{auto_vcname}** · FCF: {auto_fcf} bn")
+        use_auto_v = True
     else:
-        cashflow_rows = st.session_state.cashflow_rows
-        params = st.session_state.forecast_params
-        fcf_list = [r["FCF"] for r in cashflow_rows]
-        years = [r["Year"] for r in cashflow_rows]
+        use_auto_v = False
 
-        st.info(f"Projected FCF: **{years[0]}: {fcf_list[0]} bn** · **{years[1]}: {fcf_list[1]} bn** · **{years[2]}: {fcf_list[2]} bn**")
+    with st.expander("📥 Manual Input — enter FCF directly", expanded=not use_auto_v):
+        v_cname = st.text_input("Company name", value="My Company", key="v_cname")
+        vcols = st.columns(3)
+        manual_fcf = []
+        manual_vyears = []
+        for i, col in enumerate(vcols):
+            with col:
+                yr = st.number_input(f"Year {i+1}", value=2025+i, min_value=2020, max_value=2035, step=1, key=f"v_year_{i}")
+                fcf_val = st.number_input(f"FCF (bn)", value=50.0 + i*5, step=1.0, key=f"v_fcf_{i}")
+                manual_fcf.append(fcf_val)
+                manual_vyears.append(str(int(yr)))
 
-        st.subheader("DCF Assumptions")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**Discount Rate**")
-            wacc = st.number_input("WACC %", value=9.0, min_value=1.0, max_value=30.0, step=0.5, help="Weighted average cost of capital. Typical range for tech: 8–12%")
-        with col2:
-            st.markdown("**Terminal Value**")
-            terminal_growth = st.number_input("Terminal growth rate %", value=3.0, min_value=0.0, max_value=10.0, step=0.5, help="Perpetual growth rate after Year 3. Typically ~GDP growth (2–4%)")
-        with col3:
-            st.markdown("**Equity Bridge**")
-            shares_outstanding = st.number_input("Shares outstanding (bn)", value=152.0, min_value=0.1, step=1.0)
-            net_debt = st.number_input("Net debt (USD bn)", value=310.0, step=10.0, help="Debt minus cash. Negative = net cash position")
+    # 决定用哪个数据源
+    if use_auto_v:
+        v_fcf_list = auto_fcf
+        v_years = auto_years
+        v_company = auto_vcname
+    else:
+        v_fcf_list = manual_fcf
+        v_years = manual_vyears
+        v_company = v_cname
 
-        st.subheader("Sensitivity Analysis Range")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            wacc_low = st.number_input("WACC low %", value=7.0, min_value=1.0, max_value=29.0, step=0.5)
-            wacc_high = st.number_input("WACC high %", value=12.0, min_value=2.0, max_value=30.0, step=0.5)
-        with col_b:
-            tg_low = st.number_input("Terminal growth low %", value=1.0, min_value=0.0, max_value=9.0, step=0.5)
-            tg_high = st.number_input("Terminal growth high %", value=5.0, min_value=0.5, max_value=10.0, step=0.5)
+    st.info(f"FCF inputs: **{v_years[0]}: {v_fcf_list[0]} bn** · **{v_years[1]}: {v_fcf_list[1]} bn** · **{v_years[2]}: {v_fcf_list[2]} bn**")
 
-        if st.button("💰 Run DCF Valuation"):
-            import numpy as np
+    st.subheader("DCF Assumptions")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        wacc = st.number_input("WACC %", value=9.0, min_value=1.0, max_value=30.0, step=0.5,
+            help="Weighted avg cost of capital. Tech: typically 8–12%")
+    with col2:
+        terminal_growth = st.number_input("Terminal growth rate %", value=3.0, min_value=0.0, max_value=10.0, step=0.5,
+            help="Perpetual growth after Year 3. Typically ~GDP (2–4%)")
+    with col3:
+        shares_outstanding = st.number_input("Shares outstanding (bn)", value=152.0, min_value=0.1, step=1.0)
+        net_debt = st.number_input("Net debt (bn)", value=310.0, step=10.0,
+            help="Debt minus cash. Negative = net cash")
 
-            def dcf_valuation(fcf_list, wacc_pct, tg_pct, shares, net_debt_val):
-                w = wacc_pct / 100
-                g = tg_pct / 100
-                pv_fcf = sum(fcf / (1 + w) ** (i + 1) for i, fcf in enumerate(fcf_list))
-                terminal_value = fcf_list[-1] * (1 + g) / (w - g)
-                pv_terminal = terminal_value / (1 + w) ** len(fcf_list)
-                ev = pv_fcf + pv_terminal
-                equity_value = ev - net_debt_val
-                price_per_share = equity_value / shares if shares > 0 else 0
-                return {"pv_fcf": round(pv_fcf, 1), "terminal_value": round(terminal_value, 1),
-                    "pv_terminal": round(pv_terminal, 1), "ev": round(ev, 1),
-                    "equity_value": round(equity_value, 1), "price_per_share": round(price_per_share, 2),
-                    "terminal_pct": round(pv_terminal / ev * 100, 1) if ev > 0 else 0}
+    st.subheader("Sensitivity Analysis Range")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        wacc_low = st.number_input("WACC low %", value=7.0, min_value=1.0, max_value=29.0, step=0.5)
+        wacc_high = st.number_input("WACC high %", value=12.0, min_value=2.0, max_value=30.0, step=0.5)
+    with col_b:
+        tg_low = st.number_input("Terminal growth low %", value=1.0, min_value=0.0, max_value=9.0, step=0.5)
+        tg_high = st.number_input("Terminal growth high %", value=5.0, min_value=0.5, max_value=10.0, step=0.5)
 
-            base = dcf_valuation(fcf_list, wacc, terminal_growth, shares_outstanding, net_debt)
+    if st.button("💰 Run DCF Valuation"):
+        import numpy as np
 
-            st.subheader("Base Case Results")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("PV of FCFs", f"{base['pv_fcf']} bn")
-            c2.metric("PV of Terminal Value", f"{base['pv_terminal']} bn", f"{base['terminal_pct']}% of EV")
-            c3.metric("Enterprise Value", f"{base['ev']} bn")
-            c4.metric("Intrinsic Value / Share", f"${base['price_per_share']}")
+        def dcf_valuation(fcf_list, wacc_pct, tg_pct, shares, nd):
+            w, g = wacc_pct/100, tg_pct/100
+            pv_fcf = sum(f/(1+w)**(i+1) for i,f in enumerate(fcf_list))
+            tv = fcf_list[-1]*(1+g)/(w-g)
+            pv_tv = tv/(1+w)**len(fcf_list)
+            ev = pv_fcf + pv_tv
+            eq = ev - nd
+            pps = eq/shares if shares > 0 else 0
+            return {"pv_fcf": round(pv_fcf,1), "pv_terminal": round(pv_tv,1),
+                "ev": round(ev,1), "equity_value": round(eq,1),
+                "price_per_share": round(pps,2),
+                "terminal_pct": round(pv_tv/ev*100,1) if ev > 0 else 0}
 
-            if base["terminal_pct"] > 80:
-                st.warning(f"⚠️ Terminal value is {base['terminal_pct']}% of EV — valuation is highly sensitive to long-term assumptions")
-            else:
-                st.success(f"✅ Terminal value is {base['terminal_pct']}% of EV — near-term cash flows provide meaningful support")
+        base = dcf_valuation(v_fcf_list, wacc, terminal_growth, shares_outstanding, net_debt)
 
-            # 敏感性矩阵（用number_input替代slider，避免渲染冲突）
-            st.subheader("Sensitivity Matrix — Intrinsic Value per Share ($)")
-            wacc_steps = np.arange(wacc_low, wacc_high + 0.1, 1.0)
-            tg_steps = np.arange(tg_low, tg_high + 0.1, 1.0)
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("PV of FCFs", f"{base['pv_fcf']} bn")
+        c2.metric("PV of Terminal Value", f"{base['pv_terminal']} bn", f"{base['terminal_pct']}% of EV")
+        c3.metric("Enterprise Value", f"{base['ev']} bn")
+        c4.metric("Intrinsic Value / Share", f"${base['price_per_share']}")
 
-            matrix_data = {}
-            all_prices = []
-            for w in wacc_steps:
-                row_data = {}
-                for g in tg_steps:
-                    if w <= g:
-                        row_data[f"g={g:.0f}%"] = "N/A"
-                    else:
-                        r = dcf_valuation(fcf_list, w, g, shares_outstanding, net_debt)
-                        row_data[f"g={g:.0f}%"] = f"${r['price_per_share']}"
-                        all_prices.append(r["price_per_share"])
-                matrix_data[f"WACC={w:.0f}%"] = row_data
+        if base["terminal_pct"] > 80:
+            st.warning(f"⚠️ Terminal value is {base['terminal_pct']}% of EV — highly sensitive to long-term assumptions")
+        else:
+            st.success(f"✅ Terminal value is {base['terminal_pct']}% of EV")
 
-            matrix_df = pd.DataFrame(matrix_data).T
-            st.dataframe(matrix_df, use_container_width=True)
+        wacc_steps = np.arange(wacc_low, wacc_high+0.1, 1.0)
+        tg_steps = np.arange(tg_low, tg_high+0.1, 1.0)
+        matrix_data, all_prices = {}, []
+        for w in wacc_steps:
+            row_data = {}
+            for g in tg_steps:
+                if w <= g:
+                    row_data[f"g={g:.0f}%"] = "N/A"
+                else:
+                    r = dcf_valuation(v_fcf_list, w, g, shares_outstanding, net_debt)
+                    row_data[f"g={g:.0f}%"] = f"${r['price_per_share']}"
+                    all_prices.append(r["price_per_share"])
+            matrix_data[f"WACC={w:.0f}%"] = row_data
 
-            if all_prices:
-                fig_val = go.Figure()
-                fig_val.add_trace(go.Box(y=all_prices, name="Valuation range", marker_color="#4472C4", boxpoints="all", jitter=0.3))
-                fig_val.add_hline(y=base["price_per_share"], line_dash="dash", line_color="red",
-                    annotation_text=f"Base case ${base['price_per_share']}")
-                fig_val.update_layout(title="Intrinsic Value Distribution (across WACC & terminal growth scenarios)",
-                    plot_bgcolor="white", yaxis_title="USD per share", showlegend=False)
-                st.plotly_chart(fig_val, use_container_width=True)
+        st.subheader("Sensitivity Matrix — Intrinsic Value per Share ($)")
+        st.dataframe(pd.DataFrame(matrix_data).T, use_container_width=True)
 
-                low = round(min(all_prices), 2)
-                high = round(max(all_prices), 2)
-                mid = round(sum(all_prices) / len(all_prices), 2)
-                st.info(f"📌 Valuation range: **${low} — ${high}** · Median: **${mid}**")
+        if all_prices:
+            fig_val = go.Figure()
+            fig_val.add_trace(go.Box(y=all_prices, name="Valuation range",
+                marker_color="#4472C4", boxpoints="all", jitter=0.3))
+            fig_val.add_hline(y=base["price_per_share"], line_dash="dash", line_color="red",
+                annotation_text=f"Base ${base['price_per_share']}")
+            fig_val.update_layout(title="Intrinsic Value Distribution",
+                plot_bgcolor="white", yaxis_title="USD per share", showlegend=False)
+            st.plotly_chart(fig_val, use_container_width=True)
+            low, high, mid = round(min(all_prices),2), round(max(all_prices),2), round(sum(all_prices)/len(all_prices),2)
+            st.info(f"📌 Range: **${low} — ${high}** · Median: **${mid}**")
 
-            st.session_state.dcf_result = base
-            st.session_state.dcf_params = {
-                "wacc": wacc, "terminal_growth": terminal_growth,
-                "shares": shares_outstanding, "net_debt": net_debt,
-                "price_low": min(all_prices) if all_prices else 0,
-                "price_high": max(all_prices) if all_prices else 0,
-            }
+        st.session_state.dcf_result = base
+        st.session_state.dcf_params = {"wacc": wacc, "terminal_growth": terminal_growth,
+            "shares": shares_outstanding, "net_debt": net_debt,
+            "price_low": min(all_prices) if all_prices else 0,
+            "price_high": max(all_prices) if all_prices else 0,
+            "cname": v_company}
 
-        if st.session_state.dcf_result is not None:
-            if st.button("🤖 AI Valuation Report"):
-                with st.spinner("Generating valuation report..."):
-                    base = st.session_state.dcf_result
-                    dp = st.session_state.dcf_params
-                    p = st.session_state.forecast_params
-                    cashflow_rows = st.session_state.cashflow_rows
-                    fcf_list = [r["FCF"] for r in cashflow_rows]
-
-                    prompt = f"""You are a senior equity research analyst writing a valuation report for {p['cname']}.
-
-DCF Results:
-- Base case intrinsic value: ${base['price_per_share']} per share
-- Enterprise value: {base['ev']} bn USD
-- Terminal value as % of EV: {base['terminal_pct']}%
-- Valuation range: ${dp['price_low']:.1f} — ${dp['price_high']:.1f}
-
-Key assumptions: WACC {dp['wacc']}%, terminal growth {dp['terminal_growth']}%
-FCF forecast: {fcf_list} (USD bn, next 3 years)
-
-Write a professional valuation report (~400 words) covering:
-1. Valuation conclusion: is the stock undervalued or overvalued vs current market price?
-2. Sensitivity of the valuation to key assumptions
-3. Upside and downside risks
-4. Investment recommendation (Buy / Hold / Sell) with target price range"""
-
-                    client = anthropic.Anthropic(api_key=API_KEY)
-                    message = client.messages.create(model="claude-opus-4-6", max_tokens=2000,
-                        messages=[{"role": "user", "content": prompt}])
-                    st.subheader("🤖 AI Valuation Report")
-                    st.write(message.content[0].text)
+    if st.session_state.dcf_result is not None:
+        if st.button("🤖 AI Valuation Report"):
+            with st.spinner("Generating report..."):
+                base = st.session_state.dcf_result
+                dp = st.session_state.dcf_params
+                prompt = f"""Senior equity research analyst. Valuation report for {dp['cname']}.
+DCF: base case ${base['price_per_share']}/share, EV {base['ev']} bn, terminal {base['terminal_pct']}% of EV
+Range: ${dp['price_low']:.1f}–${dp['price_high']:.1f}
+WACC {dp['wacc']}%, terminal growth {dp['terminal_growth']}%
+FCF forecast: {v_fcf_list} bn
+Report (~400 words): 1) Under/overvalued? 2) Assumption sensitivity 3) Risks 4) Buy/Hold/Sell + target price"""
+                msg = client.messages.create(model="claude-opus-4-6", max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}])
+                st.subheader("🤖 AI Valuation Report")
+                st.write(msg.content[0].text)
