@@ -23,6 +23,8 @@ def is_a_share(code):
 def process_us_data(code):
     import yfinance as yf
     ticker = yf.Ticker(code.upper())
+    info = ticker.info or {}
+    company_name = info.get("longName") or info.get("shortName") or code.upper()
     income = ticker.financials
     balance = ticker.balance_sheet
     rows = []
@@ -43,14 +45,108 @@ def process_us_data(code):
             })
         except KeyError:
             continue
-    return pd.DataFrame(rows).dropna().sort_values("年份").reset_index(drop=True)
+    df = pd.DataFrame(rows).dropna().sort_values("年份").reset_index(drop=True)
+    return df, company_name
 
 def process_a_share_data(code):
     import akshare as ak
-    df = ak.stock_financial_analysis_indicator(symbol=code)
-    df = df[df["日期"].str.endswith("12-31")].copy()
-    df["年份"] = df["日期"].str[:4].astype(int)
-    return df.sort_values("年份").tail(5).reset_index(drop=True)
+
+    def safe_float(val):
+        try:
+            return float(str(val).replace(",", "").replace("%", "").strip())
+        except:
+            return None
+
+    def extract_rows(raw, date_col):
+        """从原始DataFrame提取标准化指标"""
+        rows = []
+        for _, row in raw.iterrows():
+            def get(candidates):
+                for c in candidates:
+                    if c in raw.columns and pd.notna(row.get(c)):
+                        v = safe_float(row[c])
+                        if v is not None:
+                            return v
+                return None
+
+            net_margin  = get(["净利润率(%)", "销售净利率(%)", "净利率", "净利润率", "摊薄净利润率(%)"])
+            debt_ratio  = get(["资产负债率(%)", "资产负债比率(%)", "资产负债率"])
+            roe         = get(["净资产收益率(%)", "加权净资产收益率(%)", "ROE", "摊薄净资产收益率(%)"])
+            rev_growth  = get(["主营业务收入增长率(%)", "营业收入增长率(%)", "收入增速", "营业总收入同比增长率(%)"])
+
+            rows.append({
+                "年份": row["年份"],
+                "净利率%":    round(net_margin, 2)  if net_margin  is not None else None,
+                "资产负债率%": round(debt_ratio, 2)  if debt_ratio  is not None else None,
+                "ROE%":       round(roe, 2)          if roe         is not None else None,
+                "收入增速%":  round(rev_growth, 2)   if rev_growth  is not None else None,
+            })
+        return rows
+
+    # ---- 尝试主接口 ----
+    try:
+        raw = ak.stock_financial_analysis_indicator(symbol=code)
+
+        if raw is None or raw.empty:
+            raise ValueError("主接口返回空数据")
+
+        # 自动识别日期列
+        date_col = None
+        for candidate in ["日期", "报告期", "period", "date"]:
+            if candidate in raw.columns:
+                date_col = candidate
+                break
+        if date_col is None:
+            date_col = raw.columns[0]
+
+        # 只保留年报
+        filtered = raw[raw[date_col].astype(str).str.endswith("12-31")].copy()
+
+        if filtered.empty:
+            raise ValueError("过滤后无年报数据")
+
+        filtered["年份"] = filtered[date_col].astype(str).str[:4].astype(int)
+        filtered = filtered.sort_values("年份").tail(5).reset_index(drop=True)
+
+        rows = extract_rows(filtered, date_col)
+        result = pd.DataFrame(rows)
+
+        if result.empty or result.dropna(how="all", subset=["净利率%","资产负债率%","ROE%"]).empty:
+            raise ValueError("提取指标后数据为空")
+
+        return result
+
+    except Exception as e1:
+        # ---- 备用接口：stock_financial_abstract ----
+        try:
+            raw2 = ak.stock_financial_abstract(symbol=code)
+
+            if raw2 is None or raw2.empty:
+                raise ValueError(f"备用接口也返回空数据，原始错误：{e1}")
+
+            date_col2 = None
+            for candidate in ["报告期", "日期", "period"]:
+                if candidate in raw2.columns:
+                    date_col2 = candidate
+                    break
+            if date_col2 is None:
+                date_col2 = raw2.columns[0]
+
+            filtered2 = raw2[raw2[date_col2].astype(str).str.endswith("12-31")].copy()
+
+            if filtered2.empty:
+                # 备用接口可能没有年报筛选，取最近5条
+                filtered2 = raw2.tail(5).copy()
+
+            filtered2["年份"] = filtered2[date_col2].astype(str).str[:4].astype(int)
+            filtered2 = filtered2.sort_values("年份").tail(5).reset_index(drop=True)
+
+            # 备用接口列名不同，直接返回原始数据
+            filtered2 = filtered2.rename(columns={date_col2: "报告期"})
+            return filtered2
+
+        except Exception as e2:
+            raise ValueError(f"A股数据获取失败。\n主接口错误：{e1}\n备用接口错误：{e2}\n\n请检查：\n1）股票代码是否正确（6位数字）\n2）网络是否正常\n3）该股票是否在akshare支持范围内")
 
 # ============================================================
 # 预测建模函数
@@ -161,8 +257,13 @@ def build_income_statement(
 # 页面主体 - 标签页布局（每个Tab独立可用）
 # ============================================================
 
-st.title("AI Financial Analysis Tool")
-st.caption("Powered by Claude AI · Built for equity research")
+st.title("📊 AI Financial Analysis Tool")
+st.markdown("""
+**Understand any company's financial health in minutes — no finance background needed.**
+
+This tool walks you through four steps: fetch real data → build a forecast → model the full financials → estimate fair value.
+Each step is independent: you can jump straight to Valuation if you already have your own numbers.
+""")
 
 # session_state 初始化
 for key, default in {
@@ -178,94 +279,191 @@ for key, default in {
     "three_table_params": None,
     "dcf_result": None,
     "dcf_params": None,
+    "pepb_result": None,
+    "ai_report_text": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Data",
     "📈 Forecast",
     "📑 3-Statement",
     "💰 Valuation",
+    "📄 Export Report",
 ])
 
 # ============================================================
 # TAB 1: DATA
 # ============================================================
 with tab1:
-    st.header("Market Data")
-    st.write("Enter a stock ticker to automatically fetch financial data.")
+    # ── 封面入口选择 ──────────────────────────────────────────
+    if "entry_mode" not in st.session_state:
+        st.session_state.entry_mode = None
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        stock_code = st.text_input("Ticker Symbol",
-            placeholder="A-share: 6-digit number (e.g. 600031) · US stock: letters (e.g. AAPL)")
-    with col2:
-        company_name = st.text_input("Company Name", placeholder="e.g. Apple")
+    if st.session_state.entry_mode is None:
+        st.markdown("""
+<div style="text-align:center;padding:40px 0 20px;">
+  <h2 style="color:#2E5C8A;">Where would you like to start?</h2>
+  <p style="color:#555;font-size:1.05em;">Choose the path that fits your situation.</p>
+</div>""", unsafe_allow_html=True)
 
-    if stock_code and company_name:
-        if st.button("🔍 Fetch Data"):
-            with st.spinner("Fetching financial data..."):
-                try:
-                    if is_a_share(stock_code):
-                        df = process_a_share_data(stock_code)
-                        st.session_state.fetched_df = df
-                        st.session_state.fetched_company = company_name
-                        st.session_state.is_us_stock = False
-                        st.success("Data fetched successfully!")
-                    else:
-                        df = process_us_data(stock_code)
-                        st.session_state.fetched_df = df
-                        st.session_state.fetched_company = company_name
-                        st.session_state.is_us_stock = True
-                        if df.empty:
-                            st.warning("No data found. Please check the ticker symbol.")
-                        else:
-                            rev_col = "营业收入(亿美元)"
-                            net_col = "净利润(亿美元)"
-                            liab_col = "总负债(亿美元)"
-                            asset_col = "总资产(亿美元)"
-                            df["净利率%"] = round(df[net_col] / df[rev_col] * 100, 2)
-                            df["资产负债率%"] = round(df[liab_col] / df[asset_col] * 100, 2)
-                            df["收入增速%"] = round(df[rev_col].pct_change() * 100, 2)
+        col_l, col_r = st.columns(2, gap="large")
+        with col_l:
+            st.markdown("""
+<div style="background:#EBF2FA;border:2px solid #4472C4;border-radius:14px;padding:30px 24px;text-align:center;">
+  <div style="font-size:2.5em;">🔍</div>
+  <h3 style="color:#2E5C8A;margin:10px 0 6px;">I have a stock ticker</h3>
+  <p style="color:#555;font-size:0.95em;">Enter a ticker symbol (e.g. AAPL, TSLA) and we'll automatically pull 5 years of real financial data from the market.</p>
+  <p style="color:#777;font-size:0.85em;">Best for: investors researching public companies</p>
+</div>""", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Start with a ticker →", use_container_width=True, key="entry_ticker"):
+                st.session_state.entry_mode = "ticker"
+                st.rerun()
+
+        with col_r:
+            st.markdown("""
+<div style="background:#F0FAF0;border:2px solid #70AD47;border-radius:14px;padding:30px 24px;text-align:center;">
+  <div style="font-size:2.5em;">📝</div>
+  <h3 style="color:#2E5C8A;margin:10px 0 6px;">I'll enter my own numbers</h3>
+  <p style="color:#555;font-size:0.95em;">You already have financial data — from an annual report, spreadsheet, or your own research. Skip straight to building forecasts.</p>
+  <p style="color:#777;font-size:0.85em;">Best for: analysts with existing data</p>
+</div>""", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Enter my own numbers →", use_container_width=True, key="entry_manual"):
+                st.session_state.entry_mode = "manual"
+                st.rerun()
+
+    # ── 入口 A：股票代码 ──────────────────────────────────────
+    elif st.session_state.entry_mode == "ticker":
+        if st.button("← Back", key="back_ticker"):
+            st.session_state.entry_mode = None
+            st.rerun()
+
+        st.header("📊 Fetch Company Data")
+        st.write("Enter a ticker symbol — we'll look up the company name and pull all the numbers automatically.")
+
+        stock_code = st.text_input(
+            "Ticker Symbol",
+            placeholder="US stock: AAPL, TSLA, NVDA  ·  A-share (China): 600031, 688017",
+            help="A ticker is the short code used to identify a stock on an exchange. For example, Apple's ticker is AAPL."
+        )
+
+        if stock_code:
+            if st.button("🔍 Fetch Data"):
+                with st.spinner("Looking up company and fetching data..."):
+                    try:
+                        if is_a_share(stock_code):
+                            df = process_a_share_data(stock_code)
+                            auto_cname = stock_code  # A股暂无自动名称
                             st.session_state.fetched_df = df
-                            st.success("Data fetched successfully!")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                            st.session_state.fetched_company = auto_cname
+                            st.session_state.is_us_stock = False
+                            st.success(f"✅ Data fetched for {auto_cname}!")
+                        else:
+                            df, auto_cname = process_us_data(stock_code)
+                            st.session_state.fetched_df = df
+                            st.session_state.fetched_company = auto_cname
+                            st.session_state.is_us_stock = True
+                            if df.empty:
+                                st.warning("No data found. Please double-check the ticker symbol.")
+                            else:
+                                rev_col = "营业收入(亿美元)"
+                                net_col = "净利润(亿美元)"
+                                liab_col = "总负债(亿美元)"
+                                asset_col = "总资产(亿美元)"
+                                df["净利率%"] = round(df[net_col] / df[rev_col] * 100, 2)
+                                df["资产负债率%"] = round(df[liab_col] / df[asset_col] * 100, 2)
+                                df["收入增速%"] = round(df[rev_col].pct_change() * 100, 2)
+                                st.session_state.fetched_df = df
+                                st.success(f"✅ Found **{auto_cname}** — data loaded!")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
-    if st.session_state.fetched_df is not None and st.session_state.is_us_stock:
-        df = st.session_state.fetched_df
-        cname = st.session_state.fetched_company
-        st.subheader(f"{cname} — Historical Financials (USD bn)")
-        st.dataframe(df)
-        chart_df = df[["年份", "净利率%", "资产负债率%"]].copy()
-        chart_df["年份"] = chart_df["年份"].astype(str)
-        fig = px.line(chart_df.melt(id_vars="年份", var_name="Metric", value_name="Value"),
-            x="年份", y="Value", color="Metric", markers=True,
-            title=f"{cname} — Net Margin % & Debt Ratio %")
-        fig.update_layout(hovermode="x unified", plot_bgcolor="white")
-        st.plotly_chart(fig, use_container_width=True)
-        latest = df.iloc[-1]
-        st.subheader("Risk Flags")
-        if latest["资产负债率%"] > 70:
-            st.error(f"⚠️ High leverage: {latest['资产负债率%']}%")
-        else:
-            st.success(f"✅ Leverage normal: {latest['资产负债率%']}%")
-        if latest["净利率%"] < 0:
-            st.error(f"🔴 Negative net margin: {latest['净利率%']}%")
-        else:
-            st.success(f"✅ Net margin positive: {latest['净利率%']}%")
+        if st.session_state.fetched_df is not None:
+            df = st.session_state.fetched_df
+            cname = st.session_state.fetched_company
+            is_us = st.session_state.is_us_stock
 
-    with st.expander("📁 Manual Upload (Excel fallback)"):
-        uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
-        manual_company = st.text_input("Company Name", placeholder="e.g. Tuopu Group", key="manual")
+            st.subheader(f"{cname} — {'Historical Financials (USD bn)' if is_us else '历史财务指标（A股）'}")
+            st.dataframe(df)
+
+            st.subheader("📖 What do these numbers mean?")
+            latest = df.iloc[-1]
+
+            def metric_card(label, value, good_range, explanation, is_good):
+                color = "#d4edda" if is_good else "#f8d7da"
+                icon = "✅" if is_good else "⚠️"
+                st.markdown(f"""
+<div style="background:{color};padding:14px 18px;border-radius:10px;margin-bottom:10px;">
+<b>{icon} {label}: {value}</b><br>
+<span style="font-size:0.9em;color:#333;">{explanation}</span><br>
+<span style="font-size:0.82em;color:#555;">Healthy range: {good_range}</span>
+</div>""", unsafe_allow_html=True)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if pd.notna(latest.get("净利率%")):
+                    nm = latest["净利率%"]
+                    metric_card("Net Margin", f"{nm}%", "10–30% for most industries",
+                        f"Out of every $100 in revenue, {cname} keeps ${round(nm,1)} as profit after all costs and taxes. {'Strong profitability.' if nm > 15 else 'Below average — watch cost trends.' if nm > 0 else 'The company is currently losing money.'}",
+                        nm > 10)
+                if pd.notna(latest.get("收入增速%")):
+                    rg = latest["收入增速%"]
+                    metric_card("Revenue Growth", f"{rg}%", ">10% = fast-growing, 0–10% = stable",
+                        f"Revenue {'grew' if rg >= 0 else 'shrank'} by {abs(round(rg,1))}% last year. {'Strong momentum.' if rg > 15 else 'Steady growth.' if rg > 0 else 'Declining top line — needs investigation.'}",
+                        rg > 5)
+            with col_b:
+                if pd.notna(latest.get("资产负债率%")):
+                    dr = latest["资产负债率%"]
+                    metric_card("Debt Ratio", f"{dr}%", "Below 60% is generally safe",
+                        f"{round(dr,1)}% of {cname}'s assets are funded by debt. {'Conservative balance sheet.' if dr < 40 else 'Moderate leverage.' if dr < 60 else 'High leverage — financial risk is elevated.'}",
+                        dr < 60)
+                if pd.notna(latest.get("ROE%")):
+                    roe = latest["ROE%"]
+                    metric_card("Return on Equity (ROE)", f"{roe}%", "Above 15% is considered strong",
+                        f"For every $100 shareholders invested, the company earned ${round(roe,1)}. {'Excellent capital efficiency.' if roe > 20 else 'Decent returns.' if roe > 10 else 'Low returns on equity.'}",
+                        roe > 15)
+
+            chart_cols = [c for c in ["净利率%", "资产负债率%", "ROE%", "收入增速%"] if c in df.columns]
+            if chart_cols:
+                st.subheader("📈 5-Year Trend")
+                st.write("Trends often matter more than a single year's number. Look for consistent improvement or warning signs.")
+                chart_df = df[["年份"] + chart_cols].copy()
+                chart_df["年份"] = chart_df["年份"].astype(str)
+                fig = px.line(chart_df.melt(id_vars="年份", var_name="Metric", value_name="Value"),
+                    x="年份", y="Value", color="Metric", markers=True,
+                    title=f"{cname} — Key Ratios (5-Year)")
+                fig.update_layout(hovermode="x unified", plot_bgcolor="white",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ── 入口 B：手动上传 ──────────────────────────────────────
+    elif st.session_state.entry_mode == "manual":
+        if st.button("← Back", key="back_manual"):
+            st.session_state.entry_mode = None
+            st.rerun()
+
+        st.header("📝 Upload Your Own Data")
+        st.write("Upload an Excel file with your financial data. The file should have these columns:")
+        st.code("年份 | 净利润 | 营业收入 | 总负债 | 总资产", language=None)
+        st.info("💡 Once uploaded, head to the **Forecast** tab to start building your model. You can skip the Data tab entirely.")
+
+        uploaded_file = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
+        manual_company = st.text_input("Company Name", placeholder="e.g. My Portfolio Company")
+
         if uploaded_file and manual_company:
             df_m = pd.read_excel(uploaded_file)
             df_m["净利率%"] = round(df_m["净利润"] / df_m["营业收入"] * 100, 2)
             df_m["资产负债率%"] = round(df_m["总负债"] / df_m["总资产"] * 100, 2)
             df_m["收入增速%"] = round(df_m["营业收入"].pct_change() * 100, 2)
+            st.session_state.fetched_df = df_m
+            st.session_state.fetched_company = manual_company
+            st.session_state.is_us_stock = False
+            st.success(f"✅ Data loaded for {manual_company}")
             st.dataframe(df_m[["年份", "净利率%", "资产负债率%", "收入增速%"]])
-            if st.button("Generate AI Report", key="manual_ai"):
+            if st.button("Generate AI Summary", key="manual_ai"):
                 with st.spinner("Analyzing..."):
                     data_text = "".join(f"{int(r['年份'])}: Net margin {r['净利率%']}%, Debt ratio {r['资产负债率%']}%\n" for _, r in df_m.iterrows())
                     prompt = f"As a securities analyst, analyze {manual_company} in 200 words:\n{data_text}"
@@ -277,12 +475,10 @@ with tab1:
 # TAB 2: FORECAST
 # ============================================================
 with tab2:
-    st.header("Income Statement Forecast")
+    st.header("📈 Income Statement Forecast")
+    st.write("Build a 3-year projection of revenue and profit based on your assumptions about the business.")
 
-    # ---- 数据来源：自动填入 or 手动输入 ----
-    # 背景知识：如果 Data tab 已经获取了数据，就自动读取基准年数据
-    # 如果没有，用户可以在下面的手动输入框直接填数字，一样能跑
-
+    # ---- 数据来源 ----
     if st.session_state.fetched_df is not None and st.session_state.is_us_stock:
         df = st.session_state.fetched_df
         cname_f = st.session_state.fetched_company
@@ -294,12 +490,12 @@ with tab2:
     else:
         use_auto = False
 
-    with st.expander("📥 Manual Input — enter base year data directly", expanded=not use_auto):
+    with st.expander("📥 Enter base year data manually", expanded=not use_auto):
         m_cname = st.text_input("Company name", value="My Company", key="f_cname")
         m_base_year = st.number_input("Base year", value=2024, min_value=2000, max_value=2030, step=1, key="f_year")
-        m_base_rev = st.number_input("Base year revenue (USD bn)", value=100.0, min_value=0.1, step=1.0, key="f_rev")
+        m_base_rev = st.number_input("Base year revenue (USD bn)", value=100.0, min_value=0.1, step=1.0, key="f_rev",
+            help="Total revenue the company earned in the most recent full year, in billions of USD.")
 
-    # 决定用哪个数据源
     if use_auto:
         f_cname = cname_f
         f_base_year = auto_base_year
@@ -313,20 +509,60 @@ with tab2:
 
     st.info(f"Base year: **{f_base_year}** · Revenue: **{f_base_rev} bn USD**")
 
+    # ── 收入驱动因子 ──────────────────────────────────────────
     st.subheader("Step 1 — Revenue Drivers")
-    num_drivers = st.radio("Number of drivers", [1, 2, 3], index=1, horizontal=True)
+
+    # 解释弹窗
+    with st.expander("❓ What are Revenue Drivers — and what should I put here?"):
+        st.markdown("""
+**Revenue drivers are the key business variables that determine how much money the company makes.**
+
+The idea is simple: instead of just guessing "revenue will grow 10%", you break revenue down into its components and forecast each one separately. This makes your assumptions more transparent and easier to challenge.
+
+**Examples by industry:**
+
+| Industry | Driver 1 | Driver 2 |
+|----------|----------|----------|
+| Car manufacturer | Units sold (mn cars) | Average selling price (USD) |
+| Streaming service | Subscribers (mn) | Monthly fee (USD) |
+| Retailer | Number of stores | Revenue per store (mn USD) |
+| SaaS company | Paying customers | Annual revenue per customer (USD) |
+
+**How it works in this tool:**
+- You set what each driver was in the base year
+- Then you forecast where each driver will be in years 1, 2, and 3
+- Revenue = base revenue × (driver changes combined)
+
+**Not sure what to use?** Just pick 1 driver called "Revenue Growth Rate (%)" and set the base to 100. Then forecast 105, 110, 115 for 5% annual growth.
+""")
+
+    num_drivers = st.radio("How many drivers do you want to use?", [1, 2, 3], index=1, horizontal=True,
+        help="More drivers = more detailed model. Start with 2 if you're new to this.")
+
     driver_names, driver_bases = [], []
+    default_names = ["Units Sold (mn)", "ASP (USD)", "Market Share%"]
+    default_help = [
+        "How many units/customers/subscribers does the company have? Enter the number in the base year.",
+        "What is the average price per unit/customer/subscription? Enter in USD.",
+        "What percentage of the total market does this company serve?"
+    ]
     for i in range(num_drivers):
+        st.markdown(f"**Driver {i+1}**")
         c1, c2 = st.columns([2, 1])
         with c1:
-            name = st.text_input(f"Driver {i+1} name",
-                value=["Units Sold (mn)", "ASP (USD)", "Market Share%"][i], key=f"driver_name_{i}")
+            name = st.text_input(f"Driver {i+1} name — what does it measure?",
+                value=default_names[i], key=f"driver_name_{i}",
+                help=default_help[i])
         with c2:
-            base_val = st.number_input(f"Base value ({f_base_year})", value=100.0, key=f"driver_base_{i}")
+            base_val = st.number_input(f"Base value in {f_base_year}",
+                value=100.0, key=f"driver_base_{i}",
+                help=f"What was the value of this driver in {f_base_year}? Use the same unit as your driver name.")
         driver_names.append(name)
         driver_bases.append(base_val)
 
-    st.subheader("Step 2 — 3-Year Projections")
+    # ── 3年预测 ───────────────────────────────────────────────
+    st.subheader("Step 2 — 3-Year Forecasts")
+    st.write("Now enter where you think each driver will be in each of the next 3 years.")
     forecast_years = [f_base_year + 1, f_base_year + 2, f_base_year + 3]
     year_cols = st.columns(3)
     year_driver_values = []
@@ -339,13 +575,37 @@ with tab2:
                 year_vals.append(val)
             year_driver_values.append(year_vals)
 
+    # ── P&L 假设 ──────────────────────────────────────────────
+    st.subheader("Step 3 — Profitability Assumptions")
+    st.write("These ratios determine how much of the revenue turns into profit.")
+
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        gross_margin = st.number_input("Gross margin %", value=40.0, min_value=0.0, max_value=100.0, step=0.5)
+        gross_margin = st.number_input("Gross Margin %", value=40.0, min_value=0.0, max_value=100.0, step=0.5,
+            help="Revenue minus the direct cost of making the product/service, as a % of revenue.\n\nExample: If Apple sells a phone for $1,000 and it costs $600 to make, gross margin = 40%.\n\nTypical ranges: Software 60–80% | Manufacturing 20–40% | Retail 25–45%")
     with col_b:
-        expense_ratio = st.number_input("Opex ratio %", value=20.0, min_value=0.0, max_value=100.0, step=0.5)
+        expense_ratio = st.number_input("Opex Ratio %", value=20.0, min_value=0.0, max_value=100.0, step=0.5,
+            help="Operating expenses (sales, marketing, admin, R&D) as a % of revenue.\n\nThese are costs NOT directly tied to making the product — think office rent, salaries, advertising.\n\nLower is better. Best-in-class companies run at 10–20%.")
     with col_c:
-        tax_rate = st.number_input("Tax rate %", value=25.0, min_value=0.0, max_value=50.0, step=0.5)
+        tax_rate = st.number_input("Tax Rate %", value=25.0, min_value=0.0, max_value=50.0, step=0.5,
+            help="The effective corporate income tax rate.\n\nUS corporate tax: ~21%. Including state taxes: ~25–28%.\nChina: 25% standard rate. Tech companies may qualify for 15%.\n\nIf unsure, use 25%.")
+
+    with st.expander("📊 How does this model calculate profit?"):
+        st.markdown(f"""
+The income statement is built step by step:
+
+```
+Revenue                    (your driver forecast)
+− Cost of Goods Sold       (Revenue × (1 − Gross Margin%))
+= Gross Profit             (Revenue × Gross Margin%)
+− Operating Expenses       (Revenue × Opex Ratio%)
+= Operating Profit (EBIT)
+− Income Tax               (EBIT × Tax Rate%)
+= Net Income               ← the bottom line
+```
+
+**Net Margin** = Net Income / Revenue — this is the % that ends up as profit.
+""")
 
     if st.button("📈 Generate Forecast"):
         forecast_df, combined_df = build_income_statement(
@@ -690,3 +950,552 @@ Report (~400 words): 1) Under/overvalued? 2) Assumption sensitivity 3) Risks 4) 
                     messages=[{"role": "user", "content": prompt}])
                 st.subheader("🤖 AI Valuation Report")
                 st.write(msg.content[0].text)
+
+    # ============================================================
+    # PE/PB 相对估值
+    # 背景知识：
+    # PE（市盈率）= 股价 / 每股收益(EPS)，反映市场愿意为每1元利润付多少钱
+    # PB（市净率）= 股价 / 每股净资产(BVPS)，反映市场愿意为每1元净资产付多少钱
+    # 相对估值的逻辑：给定一个"合理倍数"，反推目标价
+    # ============================================================
+    st.divider()
+    st.subheader("📐 Relative Valuation — PE & PB")
+    st.write("Estimate target price based on earnings and book value multiples.")
+
+    # ---- 数据来源 ----
+    # 优先从三表/预测模块读取净利润和股东权益
+    auto_ni, auto_eq, auto_shares_rel = None, None, None
+    if st.session_state.get("income_rows"):
+        # 取最后一年预测净利润
+        auto_ni = st.session_state.income_rows[-1]["Net Income"]
+    if st.session_state.get("balance_rows"):
+        auto_eq = st.session_state.balance_rows[-1]["Equity"]
+    if st.session_state.get("dcf_params"):
+        auto_shares_rel = st.session_state.dcf_params.get("shares")
+
+    with st.expander("📥 Manual Input — enter financials directly",
+                     expanded=(auto_ni is None)):
+        rel_cname  = st.text_input("Company name", value=st.session_state.dcf_params.get("cname", "Company") if st.session_state.dcf_params else "Company", key="rel_cname")
+        rel_ni     = st.number_input("Net Income — forward year (bn)", value=float(auto_ni) if auto_ni else 50.0, step=1.0, key="rel_ni")
+        rel_eq     = st.number_input("Shareholders' Equity (bn)",      value=float(auto_eq) if auto_eq else 200.0, step=1.0, key="rel_eq")
+        rel_shares = st.number_input("Shares outstanding (bn)",        value=float(auto_shares_rel) if auto_shares_rel else 152.0, step=1.0, key="rel_shares")
+
+    # 如果上游有数据就用，否则用手动输入
+    f_ni     = auto_ni     if auto_ni     else st.session_state.get("rel_ni",     50.0)
+    f_eq     = auto_eq     if auto_eq     else st.session_state.get("rel_eq",     200.0)
+    f_shares = auto_shares_rel if auto_shares_rel else st.session_state.get("rel_shares", 152.0)
+    f_ni     = st.session_state.get("rel_ni",     f_ni)
+    f_eq     = st.session_state.get("rel_eq",     f_eq)
+    f_shares = st.session_state.get("rel_shares", f_shares)
+
+    # ---- PE 假设 ----
+    st.markdown("**PE Valuation**")
+    col_pe1, col_pe2, col_pe3 = st.columns(3)
+    with col_pe1:
+        pe_bear = st.number_input("Bear case PE", value=20.0, min_value=1.0, step=1.0,
+            help="Conservative multiple — e.g. trough historical PE")
+    with col_pe2:
+        pe_base = st.number_input("Base case PE", value=28.0, min_value=1.0, step=1.0,
+            help="Mid-cycle or industry average PE")
+    with col_pe3:
+        pe_bull = st.number_input("Bull case PE", value=35.0, min_value=1.0, step=1.0,
+            help="Premium multiple — e.g. peak historical or high-growth peers")
+
+    # ---- PB 假设 ----
+    st.markdown("**PB Valuation**")
+    col_pb1, col_pb2, col_pb3 = st.columns(3)
+    with col_pb1:
+        pb_bear = st.number_input("Bear case PB", value=5.0, min_value=0.1, step=0.5,
+            help="Low end of historical PB range")
+    with col_pb2:
+        pb_base = st.number_input("Base case PB", value=8.0, min_value=0.1, step=0.5,
+            help="Average historical PB")
+    with col_pb3:
+        pb_bull = st.number_input("Bull case PB", value=12.0, min_value=0.1, step=0.5,
+            help="Peak PB or premium peers")
+
+    if st.button("📐 Run PE/PB Valuation"):
+        # EPS = 净利润 / 总股数
+        eps = f_ni / f_shares if f_shares > 0 else 0
+        # BVPS = 所有者权益 / 总股数
+        bvps = f_eq / f_shares if f_shares > 0 else 0
+
+        # PE目标价
+        pe_price_bear = round(eps * pe_bear, 2)
+        pe_price_base = round(eps * pe_base, 2)
+        pe_price_bull = round(eps * pe_bull, 2)
+
+        # PB目标价
+        pb_price_bear = round(bvps * pb_bear, 2)
+        pb_price_base = round(bvps * pb_base, 2)
+        pb_price_bull = round(bvps * pb_bull, 2)
+
+        st.markdown(f"**EPS (forward):** ${round(eps,2)}  ·  **BVPS:** ${round(bvps,2)}")
+
+        # ---- 展示结果表 ----
+        st.subheader("PE & PB Target Price Summary")
+        summary_df = pd.DataFrame({
+            "Method": ["PE Valuation", "PB Valuation"],
+            "Bear Case ($)": [pe_price_bear, pb_price_bear],
+            "Base Case ($)": [pe_price_base, pb_price_base],
+            "Bull Case ($)": [pe_price_bull, pb_price_bull],
+        }).set_index("Method")
+        st.dataframe(summary_df)
+
+        # ---- 可视化：三法对比瀑布图 ----
+        dcf_low  = st.session_state.dcf_params.get("price_low",  0) if st.session_state.dcf_params else 0
+        dcf_high = st.session_state.dcf_params.get("price_high", 0) if st.session_state.dcf_params else 0
+        dcf_base_price = st.session_state.dcf_result.get("price_per_share", 0) if st.session_state.dcf_result else 0
+
+        fig_rel = go.Figure()
+
+        # DCF 区间
+        if dcf_low and dcf_high:
+            fig_rel.add_trace(go.Bar(
+                name="DCF", x=["DCF"],
+                y=[dcf_high - dcf_low],
+                base=[dcf_low],
+                marker_color="#4472C4",
+                width=0.4,
+            ))
+            fig_rel.add_trace(go.Scatter(
+                x=["DCF"], y=[dcf_base_price],
+                mode="markers", name="DCF Base",
+                marker=dict(color="#4472C4", size=12, symbol="diamond"),
+                showlegend=True,
+            ))
+
+        # PE 区间
+        fig_rel.add_trace(go.Bar(
+            name="PE", x=["PE"],
+            y=[pe_price_bull - pe_price_bear],
+            base=[pe_price_bear],
+            marker_color="#ED7D31",
+            width=0.4,
+        ))
+        fig_rel.add_trace(go.Scatter(
+            x=["PE"], y=[pe_price_base],
+            mode="markers", name="PE Base",
+            marker=dict(color="#ED7D31", size=12, symbol="diamond"),
+            showlegend=True,
+        ))
+
+        # PB 区间
+        fig_rel.add_trace(go.Bar(
+            name="PB", x=["PB"],
+            y=[pb_price_bull - pb_price_bear],
+            base=[pb_price_bear],
+            marker_color="#70AD47",
+            width=0.4,
+        ))
+        fig_rel.add_trace(go.Scatter(
+            x=["PB"], y=[pb_price_base],
+            mode="markers", name="PB Base",
+            marker=dict(color="#70AD47", size=12, symbol="diamond"),
+            showlegend=True,
+        ))
+
+        fig_rel.update_layout(
+            title="Valuation Range Comparison — DCF vs PE vs PB",
+            plot_bgcolor="white",
+            yaxis_title="Target Price (USD)",
+            barmode="overlay",
+            showlegend=True,
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_rel, use_container_width=True)
+
+        # ---- 三法交叉：取重叠区间 ----
+        st.subheader("📌 Cross-Validation Summary")
+        all_lows  = [dcf_low, pe_price_bear, pb_price_bear] if dcf_low else [pe_price_bear, pb_price_bear]
+        all_highs = [dcf_high, pe_price_bull, pb_price_bull] if dcf_high else [pe_price_bull, pb_price_bull]
+        all_bases = [dcf_base_price, pe_price_base, pb_price_base] if dcf_base_price else [pe_price_base, pb_price_base]
+
+        consensus_low  = round(max(all_lows), 2)   # 三法下限的最大值（最保守的共识）
+        consensus_high = round(min(all_highs), 2)  # 三法上限的最小值（最谨慎的上限）
+        consensus_mid  = round(sum(all_bases) / len(all_bases), 2)
+
+        if consensus_low < consensus_high:
+            st.success(f"✅ **Consensus range: ${consensus_low} — ${consensus_high}** · Average base case: **${consensus_mid}**")
+            st.write("Three methods agree on this overlap zone — higher confidence in this range.")
+        else:
+            st.warning(f"⚠️ No overlapping range across methods. Average base case: **${consensus_mid}**")
+            st.write("Methods diverge significantly — review assumptions for consistency.")
+
+        # 存储PE/PB结果
+        st.session_state.pepb_result = {
+            "pe_bear": pe_price_bear, "pe_base": pe_price_base, "pe_bull": pe_price_bull,
+            "pb_bear": pb_price_bear, "pb_base": pb_price_base, "pb_bull": pb_price_bull,
+            "eps": round(eps, 2), "bvps": round(bvps, 2),
+            "consensus_low": consensus_low, "consensus_high": consensus_high,
+            "consensus_mid": consensus_mid,
+            "cname": rel_cname,
+        }
+
+    # ---- AI综合三法报告 ----
+    if st.session_state.get("pepb_result") is not None:
+        if st.button("🤖 AI Cross-Valuation Report"):
+            with st.spinner("Generating comprehensive valuation report..."):
+                pr = st.session_state.pepb_result
+                dcf_r = st.session_state.dcf_result
+                dp = st.session_state.dcf_params
+
+                dcf_summary = f"DCF base: ${dcf_r['price_per_share']}, range ${dp['price_low']:.1f}–${dp['price_high']:.1f}" if dcf_r else "DCF: not run"
+
+                prompt = f"""You are a senior equity research analyst. Write a comprehensive valuation report for {pr['cname']}.
+
+Valuation results:
+- {dcf_summary}
+- PE valuation: bear ${pr['pe_bear']} / base ${pr['pe_base']} / bull ${pr['pe_bull']} (EPS: ${pr['eps']})
+- PB valuation: bear ${pr['pb_bear']} / base ${pr['pb_base']} / bull ${pr['pb_bull']} (BVPS: ${pr['bvps']})
+- Consensus range: ${pr['consensus_low']} — ${pr['consensus_high']}, average base ${pr['consensus_mid']}
+
+Write a professional valuation conclusion (~400 words):
+1. Which method is most appropriate for this company and why?
+2. What does the convergence (or divergence) between methods tell us?
+3. Final target price recommendation with Bull/Base/Bear scenarios
+4. Investment rating: Strong Buy / Buy / Hold / Sell / Strong Sell"""
+
+                msg = client.messages.create(model="claude-opus-4-6", max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}])
+                st.session_state.ai_report_text = msg.content[0].text
+                st.subheader("🤖 AI Cross-Valuation Report")
+                st.write(msg.content[0].text)
+
+# ============================================================
+# TAB 5: EXPORT REPORT
+# ============================================================
+with tab5:
+    st.header("📄 Export Research Report")
+    st.write("Generate a professional Word document (.docx) summarising all your analysis.")
+
+    # 检查有哪些模块已完成
+    has_data     = st.session_state.fetched_df is not None
+    has_forecast = st.session_state.forecast_df is not None
+    has_3stmt    = st.session_state.cashflow_rows is not None
+    has_dcf      = st.session_state.dcf_result is not None
+    has_pepb     = st.session_state.pepb_result is not None
+
+    st.subheader("Completed Sections")
+    col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
+    col_s1.metric("📊 Data",        "✅ Done" if has_data     else "⬜ Pending")
+    col_s2.metric("📈 Forecast",    "✅ Done" if has_forecast else "⬜ Pending")
+    col_s3.metric("📑 3-Statement", "✅ Done" if has_3stmt    else "⬜ Pending")
+    col_s4.metric("💰 DCF",         "✅ Done" if has_dcf      else "⬜ Pending")
+    col_s5.metric("📐 PE/PB",       "✅ Done" if has_pepb     else "⬜ Pending")
+
+    if not (has_data or has_forecast or has_dcf or has_pepb):
+        st.info("👈 Complete at least one analysis tab to generate a report.")
+    else:
+        report_title = st.text_input("Report title", value=f"{st.session_state.fetched_company or 'Company'} — Equity Research Report")
+        analyst_name = st.text_input("Analyst name", value="")
+        include_ai_summary = st.checkbox("Include AI executive summary", value=True)
+
+        if st.button("📄 Generate Word Report"):
+            with st.spinner("Building report..."):
+                try:
+                    import subprocess, json, tempfile, base64
+                    from datetime import date
+
+                    # ---- 收集所有数据 ----
+                    cname_r = st.session_state.fetched_company or "Company"
+                    today   = date.today().strftime("%B %d, %Y")
+
+                    # AI执行摘要
+                    exec_summary = ""
+                    if include_ai_summary:
+                        parts = []
+                        if has_data:
+                            latest = st.session_state.fetched_df.iloc[-1]
+                            nm  = latest.get("净利率%", "N/A")
+                            dr  = latest.get("资产负债率%", "N/A")
+                            roe = latest.get("ROE%", "N/A")
+                            parts.append(f"Historical: Net margin {nm}%, Debt ratio {dr}%, ROE {roe}%")
+                        if has_forecast:
+                            fp = st.session_state.forecast_params
+                            fd = st.session_state.forecast_df
+                            parts.append(f"Forecast: GM {fp['gross_margin']}%, Opex {fp['expense_ratio']}%, Tax {fp['tax_rate']}%. Projected net income: {list(fd['净利润'])}")
+                        if has_dcf:
+                            d = st.session_state.dcf_result
+                            dp2 = st.session_state.dcf_params
+                            parts.append(f"DCF: base ${d['price_per_share']}/share, EV ${d['ev']}bn, range ${dp2['price_low']:.1f}–${dp2['price_high']:.1f}")
+                        if has_pepb:
+                            pr = st.session_state.pepb_result
+                            parts.append(f"PE/PB consensus: ${pr['consensus_low']}–${pr['consensus_high']}, mid ${pr['consensus_mid']}")
+
+                        ai_prompt = f"""Write a concise executive summary (200 words) for an equity research report on {cname_r}.
+Data: {'; '.join(parts)}
+Cover: investment thesis, key financial strengths/risks, valuation conclusion, and rating (Buy/Hold/Sell)."""
+                        ai_msg = client.messages.create(model="claude-opus-4-6", max_tokens=600,
+                            messages=[{"role": "user", "content": ai_prompt}])
+                        exec_summary = ai_msg.content[0].text
+
+                    # ---- 构建 JS 脚本生成 docx ----
+                    js_data = {
+                        "title": report_title,
+                        "analyst": analyst_name,
+                        "date": today,
+                        "cname": cname_r,
+                        "exec_summary": exec_summary,
+                        "has_data": has_data,
+                        "has_forecast": has_forecast,
+                        "has_3stmt": has_3stmt,
+                        "has_dcf": has_dcf,
+                        "has_pepb": has_pepb,
+                        "data_rows": st.session_state.fetched_df.to_dict("records") if has_data else [],
+                        "forecast_rows": st.session_state.forecast_df[["年份","营业收入","净利润","净利率%"]].to_dict("records") if has_forecast else [],
+                        "income_rows": st.session_state.income_rows if has_3stmt else [],
+                        "cashflow_rows": st.session_state.cashflow_rows if has_3stmt else [],
+                        "balance_rows": st.session_state.balance_rows if has_3stmt else [],
+                        "dcf": st.session_state.dcf_result if has_dcf else {},
+                        "dcf_params": st.session_state.dcf_params if has_dcf else {},
+                        "pepb": st.session_state.pepb_result if has_pepb else {},
+                        "forecast_params": st.session_state.forecast_params if has_forecast else {},
+                    }
+
+                    js_script = r"""
+const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+        HeadingLevel, AlignmentType, BorderStyle, WidthType, ShadingType,
+        PageNumber, PageBreak } = require('docx');
+const fs = require('fs');
+
+const data = JSON.parse(fs.readFileSync('/tmp/report_data.json', 'utf8'));
+
+const border = { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" };
+const borders = { top: border, bottom: border, left: border, right: border };
+const headerShade = { fill: "2E5C8A", type: ShadingType.CLEAR };
+const altShade    = { fill: "F0F4FA", type: ShadingType.CLEAR };
+
+function h1(text) {
+  return new Paragraph({ heading: HeadingLevel.HEADING_1,
+    children: [new TextRun({ text, bold: true, size: 32, color: "2E5C8A" })] });
+}
+function h2(text) {
+  return new Paragraph({ heading: HeadingLevel.HEADING_2,
+    children: [new TextRun({ text, bold: true, size: 26, color: "1A3F6B" })] });
+}
+function body(text, opts={}) {
+  return new Paragraph({ children: [new TextRun({ text, size: 22, ...opts })] });
+}
+function spacer() {
+  return new Paragraph({ children: [new TextRun("")] });
+}
+
+function makeTable(headers, rows, colWidths) {
+  const totalW = colWidths.reduce((a,b)=>a+b,0);
+  return new Table({
+    width: { size: totalW, type: WidthType.DXA },
+    columnWidths: colWidths,
+    rows: [
+      new TableRow({
+        children: headers.map((h, i) => new TableCell({
+          borders, shading: headerShade,
+          width: { size: colWidths[i], type: WidthType.DXA },
+          margins: { top: 80, bottom: 80, left: 120, right: 120 },
+          children: [new Paragraph({ children: [new TextRun({ text: String(h), bold: true, color: "FFFFFF", size: 20 })] })]
+        }))
+      }),
+      ...rows.map((row, ri) => new TableRow({
+        children: row.map((cell, i) => new TableCell({
+          borders,
+          shading: ri % 2 === 1 ? altShade : { fill: "FFFFFF", type: ShadingType.CLEAR },
+          width: { size: colWidths[i], type: WidthType.DXA },
+          margins: { top: 80, bottom: 80, left: 120, right: 120 },
+          children: [new Paragraph({ children: [new TextRun({ text: String(cell ?? "—"), size: 20 })] })]
+        }))
+      }))
+    ]
+  });
+}
+
+const children = [];
+
+// ── Cover ──────────────────────────────────────────────────
+children.push(spacer(), spacer());
+children.push(new Paragraph({
+  alignment: AlignmentType.CENTER,
+  children: [new TextRun({ text: data.title, bold: true, size: 48, color: "2E5C8A" })]
+}));
+children.push(spacer());
+children.push(new Paragraph({
+  alignment: AlignmentType.CENTER,
+  children: [new TextRun({ text: `Prepared by: ${data.analyst || "—"}   ·   Date: ${data.date}`, size: 22, color: "666666" })]
+}));
+children.push(new Paragraph({
+  alignment: AlignmentType.CENTER,
+  border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: "2E5C8A", space: 1 } },
+  children: [new TextRun({ text: "Powered by AI Financial Analysis Tool", size: 20, italics: true, color: "888888" })]
+}));
+children.push(spacer(), spacer());
+
+// ── Executive Summary ──────────────────────────────────────
+if (data.exec_summary) {
+  children.push(h1("Executive Summary"));
+  children.push(spacer());
+  data.exec_summary.split('\n').filter(l=>l.trim()).forEach(line => {
+    children.push(body(line));
+  });
+  children.push(spacer());
+}
+
+// ── Section 1: Historical Data ─────────────────────────────
+if (data.has_data && data.data_rows.length > 0) {
+  children.push(h1("1. Historical Financial Overview"));
+  children.push(spacer());
+  children.push(body("The table below shows the last 5 years of key financial ratios for " + data.cname + "."));
+  children.push(spacer());
+  const dataKeys = Object.keys(data.data_rows[0]);
+  const colW = Math.floor(9360 / dataKeys.length);
+  const colWidths = dataKeys.map(() => colW);
+  children.push(makeTable(
+    dataKeys,
+    data.data_rows.map(r => dataKeys.map(k => r[k] ?? "—")),
+    colWidths
+  ));
+  children.push(spacer());
+}
+
+// ── Section 2: Forecast ────────────────────────────────────
+if (data.has_forecast && data.forecast_rows.length > 0) {
+  children.push(h1("2. Income Statement Forecast (3-Year)"));
+  children.push(spacer());
+  const fp = data.forecast_params;
+  children.push(body(`Assumptions: Gross margin ${fp.gross_margin}% · Opex ratio ${fp.expense_ratio}% · Tax rate ${fp.tax_rate}%`));
+  children.push(spacer());
+  const fKeys = Object.keys(data.forecast_rows[0]);
+  const fColW = Math.floor(9360 / fKeys.length);
+  children.push(makeTable(
+    fKeys,
+    data.forecast_rows.map(r => fKeys.map(k => r[k] ?? "—")),
+    fKeys.map(() => fColW)
+  ));
+  children.push(spacer());
+}
+
+// ── Section 3: 3-Statement ─────────────────────────────────
+if (data.has_3stmt) {
+  children.push(h1("3. Three-Statement Model"));
+  children.push(spacer());
+
+  children.push(h2("Income Statement"));
+  const iKeys = Object.keys(data.income_rows[0]);
+  children.push(makeTable(iKeys, data.income_rows.map(r => iKeys.map(k => r[k])), iKeys.map(()=>Math.floor(9360/iKeys.length))));
+  children.push(spacer());
+
+  children.push(h2("Cash Flow Statement"));
+  const cKeys = Object.keys(data.cashflow_rows[0]);
+  children.push(makeTable(cKeys, data.cashflow_rows.map(r => cKeys.map(k => r[k])), cKeys.map(()=>Math.floor(9360/cKeys.length))));
+  children.push(spacer());
+
+  children.push(h2("Balance Sheet"));
+  const bKeys = Object.keys(data.balance_rows[0]);
+  children.push(makeTable(bKeys, data.balance_rows.map(r => bKeys.map(k => r[k])), bKeys.map(()=>Math.floor(9360/bKeys.length))));
+  children.push(spacer());
+}
+
+// ── Section 4: DCF ─────────────────────────────────────────
+if (data.has_dcf) {
+  children.push(h1("4. DCF Valuation"));
+  children.push(spacer());
+  const d = data.dcf;
+  const dp = data.dcf_params;
+  children.push(makeTable(
+    ["Metric", "Value"],
+    [
+      ["Base Case Price / Share", `$${d.price_per_share}`],
+      ["Enterprise Value", `${d.ev} bn`],
+      ["PV of FCFs", `${d.pv_fcf} bn`],
+      ["PV of Terminal Value", `${d.pv_terminal} bn (${d.terminal_pct}% of EV)`],
+      ["WACC", `${dp.wacc}%`],
+      ["Terminal Growth Rate", `${dp.terminal_growth}%`],
+      ["Valuation Range", `$${dp.price_low.toFixed(1)} — $${dp.price_high.toFixed(1)}`],
+    ],
+    [4680, 4680]
+  ));
+  children.push(spacer());
+}
+
+// ── Section 5: PE/PB ───────────────────────────────────────
+if (data.has_pepb) {
+  children.push(h1("5. Relative Valuation (PE & PB)"));
+  children.push(spacer());
+  const pr = data.pepb;
+  children.push(makeTable(
+    ["Method", "Bear Case", "Base Case", "Bull Case"],
+    [
+      ["PE Valuation", `$${pr.pe_bear}`, `$${pr.pe_base}`, `$${pr.pe_bull}`],
+      ["PB Valuation", `$${pr.pb_bear}`, `$${pr.pb_base}`, `$${pr.pb_bull}`],
+    ],
+    [2340, 2340, 2340, 2340]
+  ));
+  children.push(spacer());
+  children.push(body(`EPS: $${pr.eps}  ·  BVPS: $${pr.bvps}`, { bold: false }));
+  children.push(spacer());
+  const consensusText = pr.consensus_low < pr.consensus_high
+    ? `Consensus target price range: $${pr.consensus_low} — $${pr.consensus_high} (avg base: $${pr.consensus_mid})`
+    : `Average base case across methods: $${pr.consensus_mid} (methods diverge — review assumptions)`;
+  children.push(body(consensusText, { bold: true, color: "2E5C8A" }));
+  children.push(spacer());
+}
+
+// ── Disclaimer ─────────────────────────────────────────────
+children.push(spacer());
+children.push(new Paragraph({
+  border: { top: { style: BorderStyle.SINGLE, size: 4, color: "CCCCCC", space: 1 } },
+  children: [new TextRun({ text: "Disclaimer: This report is generated by an AI tool for informational purposes only and does not constitute investment advice. Past performance does not guarantee future results. Always conduct your own due diligence.", size: 18, italics: true, color: "888888" })]
+}));
+
+const doc = new Document({
+  styles: {
+    default: { document: { run: { font: "Arial", size: 22 } } },
+    paragraphStyles: [
+      { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
+        run: { size: 32, bold: true, font: "Arial", color: "2E5C8A" },
+        paragraph: { spacing: { before: 300, after: 150 }, outlineLevel: 0 } },
+      { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true,
+        run: { size: 26, bold: true, font: "Arial", color: "1A3F6B" },
+        paragraph: { spacing: { before: 200, after: 100 }, outlineLevel: 1 } },
+    ]
+  },
+  sections: [{
+    properties: {
+      page: {
+        size: { width: 12240, height: 15840 },
+        margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 }
+      }
+    },
+    children
+  }]
+});
+
+Packer.toBuffer(doc).then(buf => {
+  fs.writeFileSync('/tmp/report_output.docx', buf);
+  console.log('done');
+});
+"""
+
+                    # 安装依赖、写文件、运行
+                    subprocess.run(["npm", "install", "-g", "docx"], capture_output=True)
+                    with open("/tmp/report_data.json", "w") as f:
+                        json.dump(js_data, f, ensure_ascii=False, default=str)
+                    with open("/tmp/gen_report.js", "w") as f:
+                        f.write(js_script)
+
+                    result = subprocess.run(["node", "/tmp/gen_report.js"],
+                        capture_output=True, text=True, timeout=60)
+
+                    if result.returncode != 0:
+                        st.error(f"Report generation failed: {result.stderr[:500]}")
+                    else:
+                        with open("/tmp/report_output.docx", "rb") as f:
+                            docx_bytes = f.read()
+                        st.success("✅ Report generated!")
+                        st.download_button(
+                            label="⬇️ Download Report (.docx)",
+                            data=docx_bytes,
+                            file_name=f"{cname_r}_Research_Report.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
