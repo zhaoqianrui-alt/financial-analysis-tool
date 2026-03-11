@@ -4,5 +4,6 @@ plotly
 anthropic
 python-dotenv
 openpyxl
-yfinance
 akshare
+yfinance
+python-docx
