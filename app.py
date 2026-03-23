@@ -542,12 +542,13 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Data",
     "📈 Forecast",
     "📑 3-Statement",
     "💰 Valuation",
     "📄 Export Report",
+    "🔍 地雷扫描",
 ])
 
 # ============================================================
@@ -600,7 +601,6 @@ with tab1:
 
         st.header("📊 Fetch Company Data")
         st.write("Enter a ticker symbol — we'll look up the company name and pull all the numbers automatically.")
-
         stock_code = st.text_input(
             "Ticker Symbol",
             placeholder="US stock: AAPL, TSLA, NVDA  ·  A-share (China): 600031, 688017",
@@ -612,8 +612,8 @@ with tab1:
                 with st.spinner("Looking up company and fetching data..."):
                     try:
                         if is_a_share(stock_code):
-                            df = process_a_share_data(stock_code)
-                            auto_cname = stock_code  # A股暂无自动名称
+                            df, auto_cname_raw = process_a_share_data(stock_code)
+                            auto_cname = auto_cname_raw or stock_code # A股暂无自动名称
                             st.session_state.fetched_df = df
                             st.session_state.fetched_company = auto_cname
                             st.session_state.is_us_stock = False
@@ -642,14 +642,10 @@ with tab1:
             df = st.session_state.fetched_df
             cname = st.session_state.fetched_company
             is_us = st.session_state.is_us_stock
+            latest = df.iloc[-1]
 
             st.subheader(f"{cname} — {'Historical Financials (USD bn)' if is_us else '历史财务指标（A股）'}")
             st.dataframe(df)
-
-            df, auto_cname_raw = process_a_share_data(stock_code)
-            auto_cname = auto_cname_raw or stock_code
-            df = df
-
             def metric_card(label, value, good_range, explanation, is_good):
                 color = "#d4edda" if is_good else "#f8d7da"
                 icon = "✅" if is_good else "⚠️"
