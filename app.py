@@ -113,7 +113,16 @@ def process_a_share_data(code):
         if len(balance.columns) > 0 and isinstance(balance.columns[0], str):
             balance = balance.T
     if income is None or income.empty:
-        raise ValueError(f"未找到 {yahoo_code} 的财务数据，请确认股票代码正确且已上市。")
+       raise ValueError(
+    f"未找到 {yahoo_code} 的财务数据。\n\n"
+    f"雅虎财经对部分A股财务数据覆盖不完整，建议试试：\n"
+    f"• 600519（贵州茅台）\n"
+    f"• 000858（五粮液）\n"
+    f"• 601318（中国平安）\n"
+    f"• 300750（宁德时代）\n"
+    f"• 688017（绿的谐波）\n"
+    f"• 600036（招商银行）"
+)
     def safe_get(df, keys, date):
         for k in keys:
             try:
