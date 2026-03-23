@@ -659,13 +659,7 @@ with tab1:
                             if df.empty:
                                 st.warning("No data found. Please double-check the ticker symbol.")
                             else:
-                                rev_col = "营业收入(亿美元)"
-                                net_col = "净利润(亿美元)"
-                                liab_col = "总负债(亿美元)"
-                                asset_col = "总资产(亿美元)"
-                                df["净利率%"] = round(df[net_col] / df[rev_col] * 100, 2)
-                                df["资产负债率%"] = round(df[liab_col] / df[asset_col] * 100, 2)
-                                df["收入增速%"] = round(df[rev_col].pct_change() * 100, 2)
+                                df["收入增速%"] = round(df["营业收入(亿美元)"].pct_change() * 100, 2)
                                 st.session_state.fetched_df = df
                                 st.success(f"✅ Found **{auto_cname}** — data loaded!")
                     except Exception as e:
