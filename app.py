@@ -43,8 +43,16 @@ def process_us_data(code):
             revenue = income.loc["Total Revenue", date] / 1e8
             net_income = income.loc["Net Income", date] / 1e8
             total_assets = balance.loc["Total Assets", date] / 1e8
-            equity = balance.loc["Stockholders Equity", date] / 1e8
-            total_liabilities = total_assets - equity
+            equity = None
+            for eq_key in ["Stockholders Equity", "Total Equity Gross Minority Interest", "Common Stock Equity"]:
+                try:
+                    if eq_key in balance.index and pd.notna(balance.loc[eq_key, date]):
+                        equity = float(balance.loc[eq_key, date]) / 1e8
+                        break
+                except Exception:
+                    continue
+            if equity is None:
+                equity = total_assets - total_liabilities
             roe = round(net_income / equity * 100, 2) if equity and equity != 0 else None
             net_margin = round(net_income / revenue * 100, 2) if revenue else None
             debt_ratio = round(total_liabilities / total_assets * 100, 2) if total_assets else None
@@ -61,7 +69,7 @@ def process_us_data(code):
             })
         except KeyError:
             continue
-    df = pd.DataFrame(rows).dropna().sort_values("年份").reset_index(drop=True)
+    df = pd.DataFrame(rows).dropna(subset=["营业收入(亿美元)","净利润(亿美元)"]).sort_values("年份").reset_index(drop=True)
     return df, company_name
 
 def a_share_to_yahoo(code):
